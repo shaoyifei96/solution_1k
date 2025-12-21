@@ -9,22 +9,22 @@ set -euo pipefail
 
 # Config
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-CUDA_VERSION="${CUDA_VERSION:-12.4}"
+CUDA_VERSION="${CUDA_VERSION:-12.8}"
 OPENPI_REPO="${OPENPI_REPO:-https://github.com/wensi-ai/openpi.git}"
 OPENPI_BRANCH="${OPENPI_BRANCH:-behavior}"
 B1K_REPO="${B1K_REPO:-https://github.com/StanfordVL/BEHAVIOR-1K.git}"
 
-SUDO=""; if [ "${EUID:-$(id -u)}" -ne 0 ]; then SUDO="sudo"; fi
+SUDO=""
 
-# Sys deps
+# Sys deps (replaced with conda)
 export DEBIAN_FRONTEND=noninteractive
-$SUDO apt-get update
-$SUDO apt-get install -y \
-  git git-lfs curl build-essential cmake ninja-build pkg-config python3-dev \
-  libgl1-mesa-dev libglfw3 libglfw3-dev libglew-dev xorg-dev \
-  libxi-dev libxinerama-dev libxcursor1 libxrandr2 ffmpeg htop \
-  python3-venv python3-pip
-git lfs install || true
+#$SUDO apt-get update
+#$SUDO apt-get install -y \
+#  git git-lfs curl build-essential cmake ninja-build pkg-config python3-dev \
+#  libgl1-mesa-dev libglfw3 libglfw3-dev libglew-dev xorg-dev \
+#  libxi-dev libxinerama-dev libxcursor1 libxrandr2 ffmpeg htop \
+#  python3-venv python3-pip
+#git lfs install || true
 
 # uv
 if ! command -v uv >/dev/null 2>&1; then
@@ -63,7 +63,7 @@ fi
 echo "Installing BEHAVIOR-1K evaluation dependencies..."
 cd "BEHAVIOR-1K"
 chmod +x setup.sh || true
-uv pip install -e bddl
+uv pip install -e bddl3
 uv pip install -e OmniGibson[eval]
 cd ..
 
@@ -76,15 +76,15 @@ if [ -n "${WANDB_API_KEY:-}" ]; then uv run wandb login --relogin <<<"$WANDB_API
 if [ -n "${HF_TOKEN:-}" ]; then uv run huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true; fi
 
 # Fix for `/usr/bin/ld: cannot find -lcuda:` error
-ldconfig -p | grep libcuda || true
-ls -l /usr/lib/x86_64-linux-gnu/libcuda.so* /lib/x86_64-linux-gnu/libcuda.so* || true
+#ldconfig -p | grep libcuda || true
+#ls -l /usr/lib/x86_64-linux-gnu/libcuda.so* /lib/x86_64-linux-gnu/libcuda.so* || true
 
 # Create missing unversioned .so
-$SUDO ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so || true
-$SUDO ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 /lib/x86_64-linux-gnu/libcuda.so || true
+#$SUDO ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so || true
+#$SUDO ln -sf /lib/x86_64-linux-gnu/libcuda.so.1 /lib/x86_64-linux-gnu/libcuda.so || true
 
 # Make sure loader sees it
-$SUDO ldconfig
+#$SUDO ldconfig
 
 echo ""
 echo "================================================================"
