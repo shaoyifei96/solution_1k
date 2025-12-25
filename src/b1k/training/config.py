@@ -355,7 +355,7 @@ _CONFIGS = [
             repo_id="IliaLarchenko/behavior_224_rgb",
             base_config=DataConfig(
                 prompt_from_task=False,  # No text prompts for PI_BEHAVIOR
-                behavior_dataset_root="~/data/behavior_224_rgb",
+                behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
                 use_per_timestamp_norm=True,  # Enable per-timestamp normalization
             ),
             use_delta_joint_actions=True,
@@ -371,8 +371,8 @@ _CONFIGS = [
         weight_loader=weight_loaders.PiBehaviorWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=200_000,
         assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=80,
+        checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints",
+        num_workers=24,
         save_interval=500,
         keep_period=2000,
     ),
