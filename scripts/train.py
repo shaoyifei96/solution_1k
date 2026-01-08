@@ -188,11 +188,25 @@ def init_train_state(
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # === FIX START ===
+    # 1. Convert the sharding State object to a pure dict (removes VariableState wrappers)
+    #    The error happened because 'state_sharding.params' has wrappers, but 'partial_params' does not.
+    params_sharding_pure = state_sharding.params.to_pure_dict()
+
+    # 2. Filter the sharding to match EXACTLY the keys in partial_params
+    #    Since _load_weights_and_validate might drop some keys (like intermediate states),
+    #    we must ensure the sharding spec doesn't have extra keys, or device_put will fail.
+    flat_params = traverse_util.flatten_dict(partial_params)
+    flat_sharding_full = traverse_util.flatten_dict(params_sharding_pure)
+
+    flat_sharding_matched = {k: flat_sharding_full[k] for k in flat_params.keys()}
+    params_sharding_matched = traverse_util.unflatten_dict(flat_sharding_matched)
+    partial_params = jax.device_put(partial_params, params_sharding_matched)
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
         donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
+        in_shardings=(replicated_sharding, params_sharding_matched),
         out_shardings=state_sharding,
     )(init_rng, partial_params)
     

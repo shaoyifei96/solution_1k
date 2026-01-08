@@ -357,6 +357,7 @@ _CONFIGS = [
                 prompt_from_task=False,  # No text prompts for PI_BEHAVIOR
                 behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
                 use_per_timestamp_norm=True,  # Enable per-timestamp normalization
+                # episodes_index=list(range()),  # First 8 episodes per task (faster loading)
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,  # Enable FAST tokenization in data pipeline
@@ -374,7 +375,7 @@ _CONFIGS = [
         num_train_steps=200_000,
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
         checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
-        num_workers=24,
+        num_workers=10,
         save_interval=500,
         keep_period=2000,
     ),
