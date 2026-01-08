@@ -368,10 +368,12 @@ _CONFIGS = [
             decay_lr=1e-5,
         ),
         num_flow_samples=15,
-        weight_loader=weight_loaders.PiBehaviorWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/vast/projects/kumar/lab/yishao/checkpoints_50/pi_behavior_b1k_fast/behavior_50t_checkpoint/1/params"
+        ),
         num_train_steps=200_000,
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints",
+        assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
+        checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
         num_workers=24,
         save_interval=500,
         keep_period=2000,
