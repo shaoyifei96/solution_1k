@@ -9,7 +9,7 @@ from collections import deque
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
-from b1k.models.pi_behavior_config import TASK_NUM_STAGES
+from b1k.models.pi_behavior_config import TASK_NUM_PREDICATES
 from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
 from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 
@@ -86,7 +86,7 @@ class B1KPolicyWrapper():
             old_task_id = self.task_id
             self.task_id = new_task_id
             
-            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (max stages: {TASK_NUM_STAGES[new_task_id]})")
+            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (predicates: {TASK_NUM_PREDICATES[new_task_id]})")
             
             if self.checkpoint_switcher:
                 new_policy = self.checkpoint_switcher.get_policy_for_task(new_task_id)
@@ -128,11 +128,11 @@ class B1KPolicyWrapper():
         if self.task_id is None:
             return
             
-        max_stage = TASK_NUM_STAGES[self.task_id] - 1
+        num_predicates = TASK_NUM_PREDICATES[self.task_id]
         predicted_stage = int(np.argmax(predicted_subtask_logits))
         
-        if predicted_stage > max_stage:
-            predicted_stage = max_stage
+        if predicted_stage > num_predicates - 1:
+            predicted_stage = num_predicates - 1
         
         self.prediction_history.append(predicted_stage)
         
@@ -296,7 +296,7 @@ class B1KPolicyWrapper():
         
         # Log progress every 100 steps
         if self.step_count % 100 == 0:
-            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{TASK_NUM_STAGES[self.task_id]-1} | Predictions: {self.prediction_count}")
+            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{TASK_NUM_PREDICATES[self.task_id]-1} | Predictions: {self.prediction_count}")
         
         # Convert to torch tensor
         action_tensor = torch.from_numpy(current_action).float()
