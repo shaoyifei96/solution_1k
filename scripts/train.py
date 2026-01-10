@@ -92,7 +92,11 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
-    """Loads and validates the weights. Returns a loaded subset of the weights."""
+    """Loads and validates the weights. Returns a loaded subset of the weights.
+    
+    Allows missing predicate-related keys in the checkpoint - these will be
+    randomly initialized (as documented in PREDICATE_MIGRATION_SUMMARY.md).
+    """
     loaded_params = loader.load(params_shape)
     
     # Filter out nnx.Intermediate fields from both sides (they're not params, excluded from checkpoints)
@@ -115,9 +119,38 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
                    if not any(field in str(k) for field in intermediate_field_names)}
         return traverse_util.unflatten_dict(filtered)
     
-    # Validate loaded params structure  
-    params_shape_filtered = filter_intermediate_fields(params_shape)
-    loaded_params_filtered = filter_intermediate_fields(loaded_params)
+    # New predicate-related keys that may be missing from old checkpoints
+    # These will be randomly initialized when missing (see PREDICATE_MIGRATION_SUMMARY.md)
+    predicate_new_keys = [
+        'predicate_projection',
+        'gate_predicate', 
+        'task_predicate_embeddings',
+        'predicate_pred_from_vlm',
+    ]
+    
+    def filter_predicate_keys(params_dict):
+        """Filter out predicate-related keys that may be missing from old checkpoints."""
+        flat = traverse_util.flatten_dict(params_dict)
+        filtered = {k: v for k, v in flat.items()
+                   if not any(key in str(k) for key in predicate_new_keys)}
+        return traverse_util.unflatten_dict(filtered)
+    
+    # Validate loaded params structure (excluding new predicate keys that may be missing)
+    params_shape_filtered = filter_predicate_keys(filter_intermediate_fields(params_shape))
+    loaded_params_filtered = filter_predicate_keys(filter_intermediate_fields(loaded_params))
+    
+    # Check which predicate keys are missing and log
+    flat_expected = traverse_util.flatten_dict(filter_intermediate_fields(params_shape))
+    flat_loaded = traverse_util.flatten_dict(filter_intermediate_fields(loaded_params))
+    missing_keys = set(flat_expected.keys()) - set(flat_loaded.keys())
+    if missing_keys:
+        missing_predicate_keys = [k for k in missing_keys if any(pk in str(k) for pk in predicate_new_keys)]
+        if missing_predicate_keys:
+            logging.info(f"Missing predicate keys in checkpoint (will be randomly initialized): {len(missing_predicate_keys)} keys")
+        other_missing = [k for k in missing_keys if k not in missing_predicate_keys]
+        if other_missing:
+            logging.warning(f"Unexpected missing keys in checkpoint: {other_missing}")
+    
     at.check_pytree_equality(expected=params_shape_filtered, got=loaded_params_filtered, check_shapes=True, check_dtypes=True)
     
     # Remove jax.ShapeDtypeStruct and Intermediate fields from the loaded params

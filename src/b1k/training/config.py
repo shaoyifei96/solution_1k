@@ -347,10 +347,8 @@ _CONFIGS = [
             max_fast_tokens=200,
             use_kv_transform=True,
             use_knowledge_insulation=False,
-            subtask_loss_weight=0.1,
             freeze_vision_backbone=True,
-            use_predicates=True,
-            predicate_data_path="data/predicate_data",
+            predicate_data_path="/vast/projects/kumar/lab/yishao/data/predicate_data/predicate_data",
             predicate_loss_weight=0.1,
         ),
         data=LeRobotB1KDataConfig(
@@ -359,7 +357,7 @@ _CONFIGS = [
                 prompt_from_task=False,  # No text prompts for PI_BEHAVIOR
                 behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
                 use_per_timestamp_norm=True,  # Enable per-timestamp normalization
-                episodes_index=list(range(100)),  # First 10 episodes per task (faster loading)
+                episodes_index=list(range(100)),  # First 100 episodes per task (faster loading)
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,  # Enable FAST tokenization in data pipeline
@@ -377,7 +375,7 @@ _CONFIGS = [
         num_train_steps=200_000,
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
         checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
-        num_workers=64, # for grain total
+        num_workers=32, # for torch or grain total
         save_interval=500,
         keep_period=2000,
     ),

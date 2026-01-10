@@ -147,5 +147,7 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         fast_tokens=getattr(observation, 'fast_tokens', None),
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
+        predicate_states=getattr(observation, 'predicate_states', None),
+        predicate_mask=getattr(observation, 'predicate_mask', None),
     )
 
