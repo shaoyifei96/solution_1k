@@ -332,7 +332,7 @@ class TrainConfig:
 _CONFIGS = [
     TrainConfig(
         name="pi_behavior_b1k_fast",
-        exp_name="openpi",
+        exp_name="b1k_predicate",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
