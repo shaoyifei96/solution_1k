@@ -264,22 +264,8 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         ),
     ]
     
-    # Add subtask state computation for PI_BEHAVIOR models (needs dataset reference)
-    model_transforms = []
-    for transform in data_config.model_transforms.inputs:
-        # ComputeSubtaskStateFromMeta needs dataset reference to access episode lengths
-        if hasattr(transform, '__class__') and transform.__class__.__name__ == 'ComputeSubtaskStateFromMeta':
-            # Replace placeholder with dataset-aware version
-            from b1k import transforms as b1k_transforms
-            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'episodes'):
-                model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
-                logging.info("Added dataset-aware ComputeSubtaskStateFromMeta transform")
-            else:
-                logging.warning("Skipping subtask state computation - dataset has no meta.episodes")
-        else:
-            model_transforms.append(transform)
-    
-    transforms_list.extend(model_transforms)
+    # Add model-specific transforms
+    transforms_list.extend(data_config.model_transforms.inputs)
     
     # Add predicate state transform for PI_BEHAVIOR models
     if model_config is not None and hasattr(model_config, 'predicate_data_path'):
@@ -435,19 +421,8 @@ def create_behavior_data_loader_grain(
         ),
     ]
     
-    # Add subtask state computation for PI_BEHAVIOR models
-    model_transforms = []
-    for transform in data_config.model_transforms.inputs:
-        if hasattr(transform, '__class__') and transform.__class__.__name__ == 'ComputeSubtaskStateFromMeta':
-            from b1k import transforms as b1k_transforms
-            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'episodes'):
-                model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
-                logging.info("Added dataset-aware ComputeSubtaskStateFromMeta transform")
-            else:
-                logging.warning("Skipping subtask state computation - dataset has no meta.episodes")
-        else:
-            model_transforms.append(transform)
-    transforms_list.extend(model_transforms)
+    # Add model-specific transforms
+    transforms_list.extend(data_config.model_transforms.inputs)
     
     # Add predicate state transform for PI_BEHAVIOR models
     model_config = config.model

@@ -108,7 +108,6 @@ class ModelTransformFactory(GroupFactory):
         return _transforms.Group(
             inputs=[
                 _transforms.ResizeImages(224, 224),
-                b1k_transforms.ComputeSubtaskStateFromMeta(dataset=None),
                 b1k_transforms.TaskIndexToTaskId(),
                 _transforms.PadStatesAndActions(model_config.action_dim),
             ],
