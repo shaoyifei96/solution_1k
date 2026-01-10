@@ -3,6 +3,35 @@
 Reference: https://github.com/wensi-ai/openpi/tree/behavior
 """
 
+# ============================================================================
+# CRITICAL FIX: Disable torch.compile to prevent fork bomb in data workers
+# ============================================================================
+# Problem: OmniGibson's BehaviorLeRobotDataset imports transform_utils.py which has
+# ~30 functions decorated with @torch_compile. When imported in each data worker,
+# these decorators get activated. On first call, torch.compile spawns ~32 compiler
+# worker processes PER function being compiled.
+#
+# Result: 32 data workers × 30 functions × 32 compiler workers = 30,000+ processes
+# This causes a "fork bomb" that maxes out CPU with process management overhead.
+#
+# Solution: Monkey-patch torch.compile to be a no-op. The OmniGibson functions
+# still work correctly (they're just not JIT-compiled), but we avoid the explosion.
+# This is safe because:
+# 1. We only need data loading, not simulation (no performance-critical ops)
+# 2. torch.compile is for inference optimization, not needed for data prep
+# 3. The @torch_compile decorator becomes effectively @no_op
+# ============================================================================
+import os
+os.environ['PYTORCH_JIT'] = '0'  # Disable JIT compilation
+
+import torch
+# Monkey-patch torch.compile to be a no-op in data workers
+_original_compile = torch.compile
+def _noop_compile(model, *args, **kwargs):
+    """No-op torch.compile for data workers to prevent fork bomb."""
+    return model
+torch.compile = _noop_compile
+
 import logging
 import time
 
@@ -22,6 +51,12 @@ from openpi.training.data_loader import (
     create_data_loader,
     create_torch_data_loader,
     create_rlds_data_loader,
+    # Grain imports (JAX-native data loading)
+    GRAIN_AVAILABLE,
+    GrainDataLoader,
+    GrainTransformedDataLoader,
+    GrainDataSource,
+    GrainTransformOp,
 )
 
 import openpi.training.config as _config
@@ -34,7 +69,7 @@ from b1k.transforms_normalize import NormalizeWithPerTimestamp
 class DataLoaderImpl(DataLoader):
     """Custom DataLoader using our Observation with fast_tokens."""
     
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader | GrainDataLoader | GrainTransformedDataLoader):
         self._data_config = data_config
         self._data_loader = data_loader
 
@@ -185,7 +220,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
             key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
         episodes=data_config.episodes_index,
-        chunk_streaming_using_keyframe=False,
+        chunk_streaming_using_keyframe=True,
         shuffle=True,
         seed=seed,
     )
@@ -308,5 +343,118 @@ def create_behavior_data_loader(
         num_workers=config.num_workers,
         seed=seed,
     )
+    
+    return DataLoaderImpl(data_config, data_loader)
+
+
+def create_behavior_data_loader_grain(
+    config: _config.TrainConfig,
+    *,
+    sharding=None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+    num_workers: int = 4,
+    prefetch_buffer_size: int = 2,
+) -> DataLoader:
+    """Create a JAX-native data loader for BEHAVIOR-1K training using grain.
+    
+    This is more efficient than create_behavior_data_loader() because:
+    1. No main process collation bottleneck - workers write directly to device memory
+    2. Transforms run in parallel worker threads
+    3. Built-in multi-host support for distributed training
+    4. Efficient prefetching and pipelining
+    
+    Args:
+        config: Training configuration
+        sharding: JAX sharding spec. If None, uses data parallel sharding.
+        shuffle: Whether to shuffle the data.
+        num_batches: Number of batches per epoch. If None, iterates indefinitely.
+        skip_norm_stats: Whether to skip normalization.
+        num_workers: Number of worker threads (recommended: 4-8 per host).
+        prefetch_buffer_size: Number of batches to prefetch.
+    
+    Returns:
+        DataLoader that yields (Observation, Actions) tuples.
+    """
+    import jax
+    import time
+    
+    if not GRAIN_AVAILABLE:
+        logging.warning("grain not available, falling back to TorchDataLoader")
+        return create_behavior_data_loader(
+            config, sharding=sharding, shuffle=shuffle, 
+            num_batches=num_batches, skip_norm_stats=skip_norm_stats
+        )
+    
+    # Import grain here to get access to grain module
+    import grain.python as grain
+    
+    data_config = config.data.create(config.assets_dirs, config.model)
+    
+    # Use random seed if not provided
+    seed = config.seed
+    if seed is None:
+        seed = int(time.time() * 1000) % (2**32)
+        logging.info(f"Using random seed: {seed}")
+    
+    # Create base dataset (without transforms)
+    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
+    
+    # Build transform list with B1K-specific per-timestamp normalization
+    norm_stats = {}
+    if data_config.repo_id != "fake" and not skip_norm_stats:
+        if data_config.norm_stats is None:
+            raise ValueError(
+                "Normalization stats not found. "
+                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+            )
+        norm_stats = data_config.norm_stats
+    
+    transforms_list = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        NormalizeWithPerTimestamp(
+            norm_stats, 
+            use_quantiles=data_config.use_quantile_norm,
+            use_per_timestamp=data_config.use_per_timestamp_norm
+        ),
+    ]
+    
+    # Add subtask state computation for PI_BEHAVIOR models
+    model_transforms = []
+    for transform in data_config.model_transforms.inputs:
+        if hasattr(transform, '__class__') and transform.__class__.__name__ == 'ComputeSubtaskStateFromMeta':
+            from b1k import transforms as b1k_transforms
+            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'episodes'):
+                model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
+                logging.info("Added dataset-aware ComputeSubtaskStateFromMeta transform")
+            else:
+                logging.warning("Skipping subtask state computation - dataset has no meta.episodes")
+        else:
+            model_transforms.append(transform)
+    transforms_list.extend(model_transforms)
+    
+    # Set up sharding
+    if sharding is None:
+        sharding = jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), ("B",)),
+            jax.sharding.PartitionSpec("B"),
+        )
+    
+    # Use GrainTransformedDataLoader
+    data_loader = GrainTransformedDataLoader(
+        dataset=dataset,
+        transforms=transforms_list,
+        batch_size=config.batch_size,
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        prefetch_buffer_size=prefetch_buffer_size,
+    )
+    
+    logging.info(f"Created Grain data loader with {num_workers} workers, batch_size={config.batch_size}")
     
     return DataLoaderImpl(data_config, data_loader)

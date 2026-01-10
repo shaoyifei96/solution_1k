@@ -385,6 +385,13 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
     )
+    # data_loader = _data_loader.create_behavior_data_loader_grain(
+    # config, 
+    # sharding=data_sharding, 
+    # shuffle=True,
+    # num_workers=config.num_workers,  # ~4-8 per host is optimal
+    # prefetch_buffer_size=2,
+    # )
 
     data_iter = iter(data_loader)
     batch = next(data_iter)
