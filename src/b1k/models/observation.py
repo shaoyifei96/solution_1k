@@ -44,6 +44,12 @@ class Observation(Generic[ArrayT]):
     
     fast_tokens: at.Int[ArrayT, "*b t"] | None = None
     fast_token_mask: at.Bool[ArrayT, "*b t"] | None = None
+    
+    # Predicate-based conditioning (multi-label binary states)
+    # predicate_states: [B, MAX_NUM_PREDICATES] - True = object is done/at final position
+    # predicate_mask: [B, MAX_NUM_PREDICATES] - True = predicate is valid for this task
+    predicate_states: at.Bool[ArrayT, "*b p"] | None = None
+    predicate_mask: at.Bool[ArrayT, "*b p"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -68,6 +74,8 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             fast_tokens=data.get("fast_tokens"),
             fast_token_mask=data.get("fast_token_mask"),
+            predicate_states=data.get("predicate_states"),
+            predicate_mask=data.get("predicate_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

@@ -34,7 +34,7 @@ from openpi.transforms import (
     make_bool_mask,
 )
 
-from b1k.models.pi_behavior_config import TASK_NUM_STAGES
+from b1k.models.pi_behavior_config import TASK_NUM_STAGES, TASK_NUM_PREDICATES, MAX_NUM_PREDICATES
 from b1k.shared.normalize import NormStats
 
 
@@ -183,6 +183,68 @@ class ComputeSubtaskStateFromMeta(DataTransformFn):
         subtask_state = max(0, min(subtask_state, num_stages - 1))
         
         data["subtask_state"] = np.array(subtask_state, dtype=np.int32)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ComputePredicateStateFromData(DataTransformFn):
+    """Computes predicate state from precomputed state vectors.
+    
+    Each predicate represents whether an object is at its final location.
+    Multiple predicates can be True simultaneously (multi-label).
+    
+    Uses PredicateDataStore to load precomputed state vectors from pkl files.
+    The store is initialized lazily and cached globally.
+    
+    Args:
+        predicate_data_path: Path to directory with state_action_vectors.pkl files
+        max_predicates: Maximum number of predicates to pad to
+    
+    Assumes:
+    - data["episode_index"] exists
+    - data["timestamp"] exists (in seconds, will be converted to frames at 30 FPS)
+    - data["task_index"] exists
+    
+    Creates:
+    - data["predicate_states"]: [max_predicates] bool array, True = object is done
+    - data["predicate_mask"]: [max_predicates] bool array, True = valid predicate
+    """
+    
+    predicate_data_path: str = "data/predicate_data"
+    max_predicates: int = MAX_NUM_PREDICATES
+    
+    def __call__(self, data: DataDict) -> DataDict:
+        from b1k.shared.predicate_data import get_predicate_store
+        
+        # Default to zeros if required fields are missing
+        if "episode_index" not in data or "timestamp" not in data or "task_index" not in data:
+            data["predicate_states"] = np.zeros(self.max_predicates, dtype=bool)
+            data["predicate_mask"] = np.zeros(self.max_predicates, dtype=bool)
+            return data
+        
+        task_index = int(data["task_index"])
+        episode_index = int(data["episode_index"])
+        timestamp = float(data["timestamp"])
+        
+        # Convert timestamp (seconds) to frame index (30 FPS)
+        frame_idx = int(timestamp * 30.0)
+        
+        try:
+            store = get_predicate_store(self.predicate_data_path)
+            predicate_states, predicate_mask = store.get_predicate_state(
+                task_id=task_index,
+                episode_id=episode_index,
+                frame_idx=frame_idx,
+                max_predicates=self.max_predicates
+            )
+        except Exception as e:
+            logging.warning(f"Failed to get predicate state: {e}, using zeros")
+            predicate_states = np.zeros(self.max_predicates, dtype=bool)
+            predicate_mask = np.zeros(self.max_predicates, dtype=bool)
+        
+        data["predicate_states"] = predicate_states
+        data["predicate_mask"] = predicate_mask
+        
         return data
 
 

@@ -23,10 +23,10 @@ from openpi.shared import array_typing as at
 from b1k.models import pi_behavior_config
 from b1k.models.observation import Observation, preprocess_observation
 from b1k.models.pi_behavior_config import (
-    TASK_NUM_STAGES, 
-    MAX_NUM_STAGES, 
-    TOTAL_TASK_STAGE_EMBEDDINGS, 
-    TASK_STAGE_OFFSETS
+    TASK_NUM_PREDICATES,
+    MAX_NUM_PREDICATES,
+    TOTAL_TASK_PREDICATE_EMBEDDINGS,
+    TASK_PREDICATE_OFFSETS,
 )
 
 logger = logging.getLogger("b1k")
@@ -143,37 +143,37 @@ class PiBehavior(_model.BaseModel):
             rngs=rngs,
         )
         
-        # Stage predictor - predicts stage from VLM output of base task token
-        # Outputs MAX_NUM_STAGES logits, but invalid stages are masked per task
-        self.stage_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_STAGES, rngs=rngs)
+        # Predicate predictor - predicts multi-label binary predicates from VLM output
+        # Outputs MAX_NUM_PREDICATES logits, sigmoid applied per predicate (independent binary)
+        self.predicate_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_PREDICATES, rngs=rngs)
         
-        # Task + subtask fusion layers
-        # Combines task embedding + cos/sin encoded subtask state
-        self.subtask_encoding_dim = config.task_embedding_dim // 2  # Half of task embedding dim (1024)
+        # Task + predicate fusion layers
+        self.predicate_encoding_dim = config.task_embedding_dim // 2  # Half of task embedding dim (1024)
         
-        # Task-specific stage embeddings (one per stage per task)
-        # Total embeddings = sum of stages across all tasks (596 for 5-15 stages per task)
-        self.task_stage_embeddings = nnx.Embed(
-            num_embeddings=TOTAL_TASK_STAGE_EMBEDDINGS,
-            features=self.subtask_encoding_dim,
+        # Task-specific predicate embeddings (one per predicate per task)
+        # Total embeddings = sum of predicates across all tasks (233 total)
+        # Each predicate embedding represents the meaning of that object/item being "done"
+        self.task_predicate_embeddings = nnx.Embed(
+            num_embeddings=TOTAL_TASK_PREDICATE_EMBEDDINGS,
+            features=self.predicate_encoding_dim,
             rngs=rngs,
         )
         
         # Gated fusion layers
-        # Input: task_embedding + sincos + task_stage_emb = task_dim + 2*subtask_dim
-        fusion_input_dim = config.task_embedding_dim + 2 * self.subtask_encoding_dim
+        # Input: task_embedding + sincos + task_predicate_emb = task_dim + 2*pred_dim
+        fusion_input_dim = config.task_embedding_dim + 2 * self.predicate_encoding_dim
         
         # Gate networks to learn how to combine different signals
-        self.gate_sincos = nnx.Linear(fusion_input_dim, self.subtask_encoding_dim, rngs=rngs)
-        self.gate_task_stage = nnx.Linear(fusion_input_dim, self.subtask_encoding_dim, rngs=rngs)
+        self.gate_sincos = nnx.Linear(fusion_input_dim, self.predicate_encoding_dim, rngs=rngs)
+        self.gate_predicate = nnx.Linear(fusion_input_dim, self.predicate_encoding_dim, rngs=rngs)
         self.gate_task = nnx.Linear(fusion_input_dim, config.task_embedding_dim, rngs=rngs)
         
         # Fusion networks to create multiple conditioned vectors
         self.fusion_layer1 = nnx.Linear(fusion_input_dim, config.task_embedding_dim * 2, rngs=rngs)
         self.fusion_layer2 = nnx.Linear(config.task_embedding_dim * 2, config.task_embedding_dim, rngs=rngs)
         
-        # Additional projection for stage-dominant representation (2 signals now)
-        self.stage_projection = nnx.Linear(2 * self.subtask_encoding_dim, config.task_embedding_dim, rngs=rngs)
+        # Additional projection for remaining-focus representation
+        self.predicate_projection = nnx.Linear(2 * self.predicate_encoding_dim, config.task_embedding_dim, rngs=rngs)
         
         # Pi05 style layers
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
@@ -218,37 +218,6 @@ class PiBehavior(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
-
-    def encode_subtask_state(
-        self, 
-        subtask_state: at.Int[at.Array, " b"],
-        task_ids: at.Int[at.Array, " b"]
-    ) -> at.Float[at.Array, "b {self.subtask_encoding_dim}"]:
-        """Encode subtask state using cos/sin positional encoding, scaled per task.
-        
-        Args:
-            subtask_state: Current stage for each sample [B]
-            task_ids: Task ID for each sample [B]
-            
-        Returns:
-            Positional encodings scaled to [0, 1] range based on task-specific stage count [B, 1024]
-        """
-        # Get number of stages for each task in batch using JAX array indexing
-        # Convert tuple to JAX array inside function to avoid import-time device allocation
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
-        task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
-        
-        # Normalize: stage 0 → 0.0, last stage → 1.0 (per-task scaling)
-        # Add maximum to avoid division by zero for edge cases
-        normalized_state = subtask_state.astype(jnp.float32) / jnp.maximum(task_num_stages.astype(jnp.float32) - 1.0, 1.0)
-        
-        # Use cos/sin encoding similar to timestep encoding
-        return posemb_sincos(
-            normalized_state, 
-            self.subtask_encoding_dim, 
-            min_period=1e-3, 
-            max_period=1.0
-        )
 
     def load_correlation_matrix(self, norm_stats: dict):
         """Load full correlation matrix from normalization statistics and apply shrinkage.
@@ -449,51 +418,142 @@ class PiBehavior(_model.BaseModel):
             'correction_matrix': correction_matrix,  # Σ_{UO}Σ_{OO}^{-1}
         }
 
-    def fuse_task_and_subtask(
-        self, task_embedding: at.Float[at.Array, "b d"], task_ids: at.Int[at.Array, " b"], subtask_state: at.Int[at.Array, " b"]
-    ) -> at.Float[at.Array, "b n d"]:
-        """Fuse task embedding with subtask state encoding using multiple representations.
+    def encode_predicate_progress(
+        self, 
+        predicate_states: at.Bool[at.Array, "b p"],
+        predicate_mask: at.Bool[at.Array, "b p"],
+    ) -> at.Float[at.Array, "b {self.predicate_encoding_dim}"]:
+        """Encode predicate progress as sincos positional encoding.
         
-        Returns multiple vectors that are differently conditioned by the subtask state:
-        1. Task-gated representation (task embedding modulated by subtask)
-        2. Balanced fusion (task + subtask combined)
-        3. Stage-dominant representation (subtask features projected to task space)
-        4. Pure stage representation (concatenated learned embeddings)
+        Progress = num_done_predicates / num_total_predicates
+        
+        Args:
+            predicate_states: [B, P] True = predicate is done
+            predicate_mask: [B, P] True = predicate is valid for this task
+            
+        Returns:
+            Positional encodings [B, 1024]
+        """
+        # Count done and total predicates
+        num_done = jnp.sum(predicate_states & predicate_mask, axis=-1).astype(jnp.float32)  # [B]
+        num_total = jnp.sum(predicate_mask, axis=-1).astype(jnp.float32)  # [B]
+        
+        # Progress: 0.0 = nothing done, 1.0 = all done
+        progress = num_done / jnp.maximum(num_total, 1.0)  # [B]
+        
+        return posemb_sincos(
+            progress, 
+            self.predicate_encoding_dim, 
+            min_period=1e-3, 
+            max_period=1.0
+        )
+
+    def aggregate_predicate_embeddings(
+        self,
+        task_ids: at.Int[at.Array, " b"],
+        predicate_states: at.Bool[at.Array, "b p"],
+        predicate_mask: at.Bool[at.Array, "b p"],
+    ) -> tuple[at.Float[at.Array, "b d"], at.Float[at.Array, "b d"]]:
+        """Aggregate predicate embeddings into done and remaining representations.
+        
+        Args:
+            task_ids: [B] Task IDs for task-specific predicate embeddings
+            predicate_states: [B, P] True = predicate is done
+            predicate_mask: [B, P] True = predicate is valid for this task
+            
+        Returns:
+            done_agg: [B, 1024] Mean of done predicate embeddings
+            remaining_agg: [B, 1024] Mean of remaining predicate embeddings
+        """
+        batch_size = task_ids.shape[0]
+        
+        # Get all predicate embeddings for each sample
+        # We need to gather embeddings for all predicates of each task
+        task_pred_offsets = jnp.array(TASK_PREDICATE_OFFSETS, dtype=jnp.int32)
+        task_num_preds = jnp.array(TASK_NUM_PREDICATES, dtype=jnp.int32)
+        
+        offsets = task_pred_offsets[task_ids]  # [B]
+        num_preds = task_num_preds[task_ids]   # [B]
+        
+        # Build indices for all predicates: [B, MAX_NUM_PREDICATES]
+        pred_range = jnp.arange(MAX_NUM_PREDICATES)  # [P]
+        pred_indices = offsets[:, None] + pred_range[None, :]  # [B, P]
+        
+        # Clamp indices to valid range (for predicates beyond task's count)
+        max_idx = TOTAL_TASK_PREDICATE_EMBEDDINGS - 1
+        pred_indices = jnp.clip(pred_indices, 0, max_idx)
+        
+        # Get all embeddings [B, P, 1024]
+        all_embeddings = self.task_predicate_embeddings(pred_indices)
+        
+        # Create done and remaining masks
+        done_mask = predicate_states & predicate_mask  # [B, P]
+        remaining_mask = ~predicate_states & predicate_mask  # [B, P]
+        
+        # Mean pooling with masks
+        # Done embeddings
+        done_sum = jnp.sum(all_embeddings * done_mask[..., None], axis=1)  # [B, 1024]
+        num_done = jnp.maximum(jnp.sum(done_mask, axis=1, keepdims=True), 1.0)  # [B, 1]
+        done_agg = done_sum / num_done  # [B, 1024]
+        
+        # Remaining embeddings
+        remaining_sum = jnp.sum(all_embeddings * remaining_mask[..., None], axis=1)  # [B, 1024]
+        num_remaining = jnp.maximum(jnp.sum(remaining_mask, axis=1, keepdims=True), 1.0)  # [B, 1]
+        remaining_agg = remaining_sum / num_remaining  # [B, 1024]
+        
+        return done_agg, remaining_agg
+
+    def fuse_task_and_predicates(
+        self, 
+        task_embedding: at.Float[at.Array, "b d"], 
+        task_ids: at.Int[at.Array, " b"], 
+        predicate_states: at.Bool[at.Array, "b p"],
+        predicate_mask: at.Bool[at.Array, "b p"],
+    ) -> at.Float[at.Array, "b n d"]:
+        """Fuse task embedding with predicate states using multiple representations.
+        
+        Uses multi-label predicates where each predicate indicates if an object is done.
+        
+        Returns multiple vectors differently conditioned by predicate states:
+        1. Task-gated representation (task embedding modulated by predicates)
+        2. Balanced fusion (task + predicates combined)
+        3. Remaining-focus representation (what to manipulate next)
+        4. Done-focus representation (what to avoid)
         
         All output representations have dimension 2048 (task_embedding_dim).
         
         Args:
             task_embedding: Base task embedding [b, 2048]
-            task_ids: Task IDs for task-specific stage embeddings [b]
-            subtask_state: Subtask state indices [b]
+            task_ids: Task IDs for task-specific predicate embeddings [b]
+            predicate_states: [B, P] True = object is done
+            predicate_mask: [B, P] True = predicate is valid for this task
             
         Returns:
             Multiple fused embeddings [b, 4, 2048]
         """
-        # Get subtask representations
-        sincos_encoding = self.encode_subtask_state(subtask_state, task_ids)  # [b, 1024]
+        # Get predicate representations
+        progress_encoding = self.encode_predicate_progress(predicate_states, predicate_mask)  # [b, 1024]
+        done_agg, remaining_agg = self.aggregate_predicate_embeddings(
+            task_ids, predicate_states, predicate_mask
+        )  # [b, 1024], [b, 1024]
         
-        # Task-specific stage embedding with corrected indexing
-        # Use vectorized lookup: offset + stage for each task
-        # Convert tuple to JAX array inside function to avoid import-time device allocation
-        task_stage_offsets_array = jnp.array(TASK_STAGE_OFFSETS, dtype=jnp.int32)
-        task_stage_offsets = task_stage_offsets_array[task_ids]  # [b] - JAX array indexing
-        task_stage_idx = task_stage_offsets + subtask_state  # [b]
-        task_stage_embedding = self.task_stage_embeddings(task_stage_idx)  # [b, 1024]
+        # Concatenate inputs for gating: task (2048) + progress (1024) + done (1024) + remaining (1024) = 5120
+        # But we need to match the existing fusion_input_dim = 4096
+        # So we use: task (2048) + progress (1024) + (done + remaining mean) (1024) = 4096
+        combined_predicate_agg = (done_agg + remaining_agg) / 2.0  # [b, 1024]
         
-        # Concatenate inputs for gating: task (2048) + sincos (1024) + task_stage (1024) = 4096
         all_inputs = jnp.concatenate([
-            task_embedding,       # [b, 2048]
-            sincos_encoding,      # [b, 1024]
-            task_stage_embedding  # [b, 1024]
+            task_embedding,        # [b, 2048]
+            progress_encoding,     # [b, 1024]
+            combined_predicate_agg # [b, 1024]
         ], axis=-1)  # [b, 4096]
         
         # Learn gates for each component (sigmoid to get 0-1 scaling)
-        gate_sincos = nnx.sigmoid(self.gate_sincos(all_inputs))      # [b, 1024]
-        gate_task_stage = nnx.sigmoid(self.gate_task_stage(all_inputs))  # [b, 1024]
-        gate_task = nnx.sigmoid(self.gate_task(all_inputs))          # [b, 2048]
+        gate_progress = nnx.sigmoid(self.gate_sincos(all_inputs))      # [b, 1024]
+        gate_predicate = nnx.sigmoid(self.gate_predicate(all_inputs))  # [b, 1024]
+        gate_task = nnx.sigmoid(self.gate_task(all_inputs))            # [b, 2048]
         
-        # 1. Task-gated representation: task embedding modulated by subtask info [b, 2048]
+        # 1. Task-gated representation: task embedding modulated by predicate info [b, 2048]
         task_gated = task_embedding * gate_task
         
         # 2. Balanced fusion: combine all signals through fusion network [b, 2048]
@@ -501,18 +561,18 @@ class PiBehavior(_model.BaseModel):
         x = nnx.relu(x)
         balanced_fusion = self.fusion_layer2(x)  # [b, 2048]
         
-        # 3. Stage-dominant: weighted combination of stage signals, then project [b, 2048]
-        gated_stage_features = jnp.concatenate([
-            sincos_encoding * gate_sincos,        # [b, 1024]
-            task_stage_embedding * gate_task_stage  # [b, 1024]
+        # 3. Remaining-focus: what to manipulate next [b, 2048]
+        gated_remaining = jnp.concatenate([
+            progress_encoding * gate_progress,  # [b, 1024]
+            remaining_agg * gate_predicate      # [b, 1024]
         ], axis=-1)  # [b, 2048]
-        stage_dominant = self.stage_projection(gated_stage_features)  # [b, 2048]
+        remaining_focus = self.predicate_projection(gated_remaining)  # [b, 2048]
         
-        # 4. Pure stage: concatenate the embeddings (already 2048) [b, 2048]
-        pure_stage = jnp.concatenate([sincos_encoding, task_stage_embedding], axis=-1)
+        # 4. Done-focus: what to avoid (pure done + progress) [b, 2048]
+        done_focus = jnp.concatenate([progress_encoding, done_agg], axis=-1)  # [b, 2048]
         
         # Stack all four representations [b, 4, 2048]
-        fused_embeddings = jnp.stack([task_gated, balanced_fusion, stage_dominant, pure_stage], axis=1)
+        fused_embeddings = jnp.stack([task_gated, balanced_fusion, remaining_focus, done_focus], axis=1)
         
         return fused_embeddings
 
@@ -546,7 +606,7 @@ class PiBehavior(_model.BaseModel):
         
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=vision_train_mode)
-            image_token_list.append(image_tokens)  # Store for subtask prediction
+            image_token_list.append(image_tokens)  # Store for predicate prediction
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -559,34 +619,35 @@ class PiBehavior(_model.BaseModel):
             # Image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        # Add task embeddings with subtask state fusion
+        # Add task embeddings with predicate state fusion
         if obs.tokenized_prompt is not None:
             # obs.tokenized_prompt now contains task_ids (shape: [batch_size, 2])
             task_ids = obs.tokenized_prompt[:, 0]  # Extract task_id: [batch_size]
             base_task_embedding = self.task_embeddings(task_ids)  # shape: [batch_size, embed_dim]
             
-            # ALWAYS use the input subtask state - never use predicted state inside model
-            if obs.tokenized_prompt.shape[1] > 1:  # If we have [task_id, subtask_state]
-                subtask_state = obs.tokenized_prompt[:, 1]  # Use input subtask state
+            # Check if predicate states are available (required for PI_BEHAVIOR)
+            if obs.predicate_states is not None and obs.predicate_mask is not None:
+                # Use predicate-based fusion
+                fused_task_embeddings = self.fuse_task_and_predicates(
+                    base_task_embedding, task_ids, 
+                    obs.predicate_states, obs.predicate_mask
+                )
             else:
-                raise ValueError("subtask_state must be provided in tokenized_prompt for PI_BEHAVIOR model")
+                raise ValueError("predicate_states and predicate_mask must be provided for PI_BEHAVIOR model")
             
-            # Fuse task embedding with subtask state - returns [b, 4, d] with multiple representations
-            fused_task_embeddings = self.fuse_task_and_subtask(base_task_embedding, task_ids, subtask_state)
-            
-            # Create task token sequence: [base_task, task_gated, balanced_fusion, stage_dominant, pure_stage]
+            # Create task token sequence: [base_task, fused_0, fused_1, fused_2, fused_3]
             task_sequence = jnp.concatenate([
                 base_task_embedding[:, None, :],  # [b, 1, d] - base task token
-                fused_task_embeddings              # [b, 4, d] - stage-conditioned tokens
+                fused_task_embeddings              # [b, 4, d] - predicate-conditioned tokens
             ], axis=1)  # [b, 5, d]
             
             tokens.append(task_sequence)
             # All task tokens are valid
             task_mask = jnp.ones((obs.tokenized_prompt.shape[0], 5), dtype=jnp.bool_)
             input_mask.append(task_mask)
-            # Hierarchical attention: base task (False) then stage tokens (True, False, False, False)
+            # Hierarchical attention: base task (False) then predicate tokens (True, False, False, False)
             # Base task attends to images bidirectionally
-            # Stage tokens attend to images+task but not vice versa
+            # Predicate tokens attend to images+task but not vice versa
             ar_mask += [False] + [True, False, False, False]
             
         # Add state as discrete tokens (Pi05 style)
@@ -605,7 +666,7 @@ class PiBehavior(_model.BaseModel):
             tokens.append(state_tokens)
             input_mask.append(jnp.ones((obs.state.shape[0], obs.state.shape[-1]), dtype=jnp.bool_))
             # State tokens have full bidirectional attention with all prefix tokens
-            # (images, task, stages, and other state tokens)
+            # (images, task, predicates, and other state tokens)
             ar_mask += [False] * state_tokens.shape[1]
         
         # FAST tokens (from observation if provided)
@@ -712,23 +773,24 @@ class PiBehavior(_model.BaseModel):
             positions=positions_prefix
         )
         
-        # 3. Predict stage from VLM output of base task token
+        # 3. Predict predicates from VLM output of base task token
         # Base task token is the first token after all image tokens
-        # Image tokens all have ar_mask=False, task starts with ar_mask=False (base) then True (stage tokens)
-        # Structure: [images (all False)] [base_task (False)] [stages (True, False, False, False)]
-        # Find first True (first stage token), base task is at that index - 1
-        first_stage_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
-        base_task_token_idx = first_stage_token_idx - 1
+        # Image tokens all have ar_mask=False, task starts with ar_mask=False (base) then True (predicate tokens)
+        # Structure: [images (all False)] [base_task (False)] [predicate_tokens (True, False, False, False)]
+        # Find first True (first predicate token), base task is at that index - 1
+        first_predicate_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
+        base_task_token_idx = first_predicate_token_idx - 1
         base_task_output = prefix_out[:, base_task_token_idx, :]
-        subtask_logits = self.stage_pred_from_vlm(base_task_output)  # [B, MAX_NUM_STAGES]
         
-        # Mask out invalid stages for each task (vectorized JAX operations)
+        # Multi-label predicate prediction
+        predicate_logits = self.predicate_pred_from_vlm(base_task_output)  # [B, MAX_NUM_PREDICATES]
         task_ids = observation.tokenized_prompt[:, 0]  # [B]
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
-        task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
-        stage_range = jnp.arange(MAX_NUM_STAGES)  # [15]
-        valid_mask = stage_range[None, :] < task_num_stages[:, None]  # [B, 15]
-        subtask_logits = jnp.where(valid_mask, subtask_logits, -jnp.inf)  # Mask invalid stages
+        
+        # Mask out invalid predicates for each task
+        task_num_preds_array = jnp.array(TASK_NUM_PREDICATES, dtype=jnp.int32)
+        task_num_preds = task_num_preds_array[task_ids]  # [B]
+        pred_range = jnp.arange(MAX_NUM_PREDICATES)  # [20]
+        valid_pred_mask = pred_range[None, :] < task_num_preds[:, None]  # [B, 20]
         
         # 4. Extract FAST loss from prefix output (before removing from cache)
         fast_loss_value = 0.0
@@ -884,21 +946,43 @@ class PiBehavior(_model.BaseModel):
         # Total action loss: mean over horizon (H) and action dims (D) -> [B]
         losses["action_loss"] = jnp.mean(action_loss, axis=(-2, -1))
 
-        # 12. Add subtask loss during training
-        subtask_loss_value = 0.0
-        if train and observation.tokenized_prompt.shape[1] > 1:            
-            ground_truth_subtask = observation.tokenized_prompt[:, 1]
-            subtask_loss = -jax.nn.log_softmax(subtask_logits)[
-                jnp.arange(ground_truth_subtask.shape[0]), ground_truth_subtask
-            ]
-            losses["subtask_loss"] = jnp.mean(subtask_loss)
-            losses["subtask_accuracy"] = jnp.mean(
-                jnp.argmax(subtask_logits, axis=-1) == ground_truth_subtask
-            )
-            subtask_loss_value = self.config.subtask_loss_weight * jnp.mean(subtask_loss)
+        # 12. Add predicate loss during training (multi-label BCE)
+        predicate_loss_value = 0.0
+        if train and observation.predicate_states is not None and observation.predicate_mask is not None:
+            # BCE loss: -[y*log(σ(x)) + (1-y)*log(1-σ(x))]
+            # Using log_sigmoid for numerical stability
+            gt_predicates = observation.predicate_states.astype(jnp.float32)  # [B, P]
+            pred_mask = observation.predicate_mask.astype(jnp.float32)  # [B, P]
+            
+            # Binary cross entropy per predicate
+            # log(σ(x)) = -softplus(-x), log(1-σ(x)) = -softplus(x)
+            pos_loss = -jax.nn.log_sigmoid(predicate_logits)  # Loss when y=1
+            neg_loss = -jax.nn.log_sigmoid(-predicate_logits)  # Loss when y=0 (i.e., log(1-sigmoid))
+            bce_loss = gt_predicates * pos_loss + (1.0 - gt_predicates) * neg_loss  # [B, P]
+            
+            # Apply mask and compute mean over valid predicates
+            masked_bce = bce_loss * pred_mask * valid_pred_mask.astype(jnp.float32)  # [B, P]
+            num_valid = jnp.maximum(jnp.sum(pred_mask * valid_pred_mask.astype(jnp.float32), axis=-1), 1.0)  # [B]
+            per_sample_loss = jnp.sum(masked_bce, axis=-1) / num_valid  # [B]
+            
+            losses["predicate_loss"] = jnp.mean(per_sample_loss)
+            
+            # Compute accuracy (threshold at 0.5, i.e., logits > 0)
+            pred_binary = predicate_logits > 0  # [B, P]
+            correct = (pred_binary == observation.predicate_states) * observation.predicate_mask * valid_pred_mask
+            num_correct = jnp.sum(correct.astype(jnp.float32), axis=-1)
+            losses["predicate_accuracy"] = jnp.mean(num_correct / num_valid)
+            
+            # Also track per-predicate-type accuracy
+            pred_done = (pred_binary & observation.predicate_states) * observation.predicate_mask * valid_pred_mask
+            gt_done = observation.predicate_states * observation.predicate_mask * valid_pred_mask
+            num_gt_done = jnp.maximum(jnp.sum(gt_done.astype(jnp.float32), axis=-1), 1.0)
+            losses["predicate_recall_done"] = jnp.mean(jnp.sum(pred_done.astype(jnp.float32), axis=-1) / num_gt_done)
+            
+            predicate_loss_value = self.config.predicate_loss_weight * jnp.mean(per_sample_loss)
         
         # 13. Total loss
-        losses["total_loss"] = losses["action_loss"] + subtask_loss_value + fast_loss_value
+        losses["total_loss"] = losses["action_loss"] + fast_loss_value + predicate_loss_value
         
         return losses
 
@@ -1006,20 +1090,12 @@ class PiBehavior(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
         
-        # Predict stage from VLM output of base task token
+        # Predict predicates from VLM output of base task token
         # Find base task token position (same logic as in compute_detailed_loss)
-        first_stage_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
-        base_task_token_idx = first_stage_token_idx - 1
+        first_predicate_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
+        base_task_token_idx = first_predicate_token_idx - 1
         base_task_output = prefix_out[:, base_task_token_idx, :]
-        subtask_logits = self.stage_pred_from_vlm(base_task_output)  # [B, MAX_NUM_STAGES]
-        
-        # Mask out invalid stages for each task (vectorized JAX operations)
         task_ids = observation.tokenized_prompt[:, 0]  # [B]
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
-        task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
-        stage_range = jnp.arange(MAX_NUM_STAGES)  # [15]
-        valid_mask = stage_range[None, :] < task_num_stages[:, None]  # [B, 15]
-        subtask_logits = jnp.where(valid_mask, subtask_logits, -jnp.inf)
         
         # Transform KV cache for cross-layer attention
         if self.kv_transform is not None:
@@ -1115,4 +1191,13 @@ class PiBehavior(_model.BaseModel):
 
         x_0, _, _ = jax.lax.while_loop(cond, step, (noise, 1.0, step_rng))
         
-        return x_0, subtask_logits
+        # Compute predicate logits for multi-label prediction
+        predicate_logits = self.predicate_pred_from_vlm(base_task_output)  # [B, MAX_NUM_PREDICATES]
+        # Mask invalid predicates for each task
+        task_num_preds_array = jnp.array(TASK_NUM_PREDICATES, dtype=jnp.int32)
+        task_num_preds = task_num_preds_array[task_ids]  # [B]
+        pred_range = jnp.arange(MAX_NUM_PREDICATES)  # [20]
+        valid_pred_mask = pred_range[None, :] < task_num_preds[:, None]  # [B, 20]
+        predicate_logits = jnp.where(valid_pred_mask, predicate_logits, -jnp.inf)
+        
+        return x_0, predicate_logits

@@ -24,21 +24,25 @@ if TYPE_CHECKING:
     from b1k.models.pi_behavior import PiBehavior
 
 
-# Per-task stage counts (based on avg_episode_length / 900, capped between 5-15)
-# Use tuple for immutability and to avoid JAX device allocation at import time
-TASK_NUM_STAGES = (
-    5, 6, 15, 15, 14, 12, 9, 15, 10, 15,  # Tasks 0-9
-    7, 13, 10, 15, 15, 15, 15, 11, 13, 12,  # Tasks 10-19
-    14, 15, 9, 15, 15, 15, 15, 15, 15, 15,  # Tasks 20-29
-    11, 10, 10, 13, 5, 5, 14, 6, 8, 10,  # Tasks 30-39
-    5, 15, 8, 15, 12, 11, 9, 14, 15, 15,  # Tasks 40-49
+# ============================================================================
+# PREDICATE-BASED CONDITIONING
+# ============================================================================
+# Per-task predicate counts (number of objects/items to track per task)
+# Each predicate = "this object is at its final location (done moving)"
+# Data from: data/predicate_data/state_vector_sizes_dict.pkl
+TASK_NUM_PREDICATES = (
+    1, 4, 6, 4, 6, 4, 4, 6, 3, 7,   # Tasks 0-9
+    5, 8, 6, 3, 3, 3, 2, 2, 3, 5,   # Tasks 10-19
+    15, 7, 4, 7, 8, 4, 20, 6, 6, 10,  # Tasks 20-29
+    4, 2, 2, 4, 1, 1, 1, 1, 1, 1,   # Tasks 30-39
+    1, 5, 3, 6, 5, 2, 2, 4, 7, 8,   # Tasks 40-49
 )
 
-MAX_NUM_STAGES = 15  # Maximum stages per task
-TOTAL_TASK_STAGE_EMBEDDINGS = sum(TASK_NUM_STAGES)  # 596 total embeddings
+MAX_NUM_PREDICATES = 20  # Maximum predicates per task (task 26 has 20)
+TOTAL_TASK_PREDICATE_EMBEDDINGS = sum(TASK_NUM_PREDICATES)  # 233 total embeddings
 
-# Cumulative offsets for indexing into task_stage_embeddings (as tuple)
-TASK_STAGE_OFFSETS = tuple([0] + [sum(TASK_NUM_STAGES[:i+1]) for i in range(len(TASK_NUM_STAGES) - 1)])
+# Cumulative offsets for indexing into task_predicate_embeddings
+TASK_PREDICATE_OFFSETS = tuple([0] + [sum(TASK_NUM_PREDICATES[:i+1]) for i in range(len(TASK_NUM_PREDICATES) - 1)])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,8 +60,8 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     num_tasks: int = 50
     # Task embedding dimension - will match the paligemma width
     task_embedding_dim: int = None  # type: ignore
-    # Maximum number of subtask states across all tasks
-    max_num_subtask_states: int = MAX_NUM_STAGES
+    # Maximum number of predicates across all tasks (task 26 has 20)
+    max_num_predicates: int = MAX_NUM_PREDICATES
     
     # Path to task data JSON file for initialization
     task_data_path: str = "b1k/BEHAVIOR-1K/docs/challenge/task_data.json"
@@ -99,9 +103,12 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Implements approach from https://www.physicalintelligence.company/research/knowledge_insulation
     use_knowledge_insulation: bool = True
     
-    # Subtask/stage prediction auxiliary loss weight (relative to action loss)
-    # Higher values emphasize stage prediction accuracy at the expense of action quality
-    subtask_loss_weight: float = 0.1
+    # Predicate prediction auxiliary loss weight (relative to action loss)
+    # Uses BCE loss for multi-label binary classification
+    predicate_loss_weight: float = 0.1
+    
+    # Path to predicate data directory containing state_action_vectors.pkl files
+    predicate_data_path: str = "data/predicate_data"
     
     # Time threshold for inpainting during inference
     # Stop enforcing inpainting constraint when t < threshold (let model be free in final steps)

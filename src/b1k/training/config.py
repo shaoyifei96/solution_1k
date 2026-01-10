@@ -350,6 +350,9 @@ _CONFIGS = [
             use_knowledge_insulation=False,
             subtask_loss_weight=0.1,
             freeze_vision_backbone=True,
+            use_predicates=True,
+            predicate_data_path="data/predicate_data",
+            predicate_loss_weight=0.1,
         ),
         data=LeRobotB1KDataConfig(
             repo_id="IliaLarchenko/behavior_224_rgb",

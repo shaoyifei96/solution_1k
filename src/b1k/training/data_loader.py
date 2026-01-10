@@ -231,11 +231,17 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     return dataset
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False, model_config=None) -> Dataset:
     """Transform dataset with B1K-specific per-timestamp normalization support.
     
     CRITICAL: This overrides wensi-ai's transform_dataset to pass use_per_timestamp to Normalize.
     wensi-ai's version doesn't support per-timestamp normalization which causes huge action losses!
+    
+    Args:
+        dataset: Base dataset to transform
+        data_config: Data configuration
+        skip_norm_stats: Whether to skip normalization
+        model_config: Model configuration (optional, used for predicate transforms)
     """
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -274,6 +280,14 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             model_transforms.append(transform)
     
     transforms_list.extend(model_transforms)
+    
+    # Add predicate state transform for PI_BEHAVIOR models
+    if model_config is not None and hasattr(model_config, 'predicate_data_path'):
+        from b1k import transforms as b1k_transforms
+        transforms_list.append(b1k_transforms.ComputePredicateStateFromData(
+            predicate_data_path=model_config.predicate_data_path
+        ))
+        logging.info(f"Added ComputePredicateStateFromData transform (path: {model_config.predicate_data_path})")
 
     return TransformedDataset(dataset, transforms_list)
 
@@ -332,7 +346,7 @@ def create_behavior_data_loader(
         logging.info(f"Using random seed: {seed}")
     
     dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, model_config=config.model)
 
     data_loader = TorchDataLoader(
         dataset,
@@ -434,6 +448,15 @@ def create_behavior_data_loader_grain(
         else:
             model_transforms.append(transform)
     transforms_list.extend(model_transforms)
+    
+    # Add predicate state transform for PI_BEHAVIOR models
+    model_config = config.model
+    if hasattr(model_config, 'predicate_data_path'):
+        from b1k import transforms as b1k_transforms
+        transforms_list.append(b1k_transforms.ComputePredicateStateFromData(
+            predicate_data_path=model_config.predicate_data_path
+        ))
+        logging.info(f"Added ComputePredicateStateFromData transform (path: {model_config.predicate_data_path})")
     
     # Set up sharding
     if sharding is None:
