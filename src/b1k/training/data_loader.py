@@ -341,6 +341,7 @@ def create_behavior_data_loader(
         shuffle=shuffle,
         num_batches=num_batches,
         num_workers=config.num_workers,
+        prefetch_factor=config.prefetch_factor,
         seed=seed,
     )
     

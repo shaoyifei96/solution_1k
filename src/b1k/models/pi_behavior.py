@@ -160,12 +160,13 @@ class PiBehavior(_model.BaseModel):
         )
         
         # Gated fusion layers
-        # Input: task_embedding + sincos + task_predicate_emb = task_dim + 2*pred_dim
+        # Input: task_embedding + done_agg + remaining_agg = task_dim + 2*pred_dim
+        # All inputs are task-specific (no shared count embeddings)
         fusion_input_dim = config.task_embedding_dim + 2 * self.predicate_encoding_dim
         
         # Gate networks to learn how to combine different signals
-        self.gate_sincos = nnx.Linear(fusion_input_dim, self.predicate_encoding_dim, rngs=rngs)
-        self.gate_predicate = nnx.Linear(fusion_input_dim, self.predicate_encoding_dim, rngs=rngs)
+        self.gate_done = nnx.Linear(fusion_input_dim, self.predicate_encoding_dim, rngs=rngs)
+        self.gate_remaining = nnx.Linear(fusion_input_dim, self.predicate_encoding_dim, rngs=rngs)
         self.gate_task = nnx.Linear(fusion_input_dim, config.task_embedding_dim, rngs=rngs)
         
         # Fusion networks to create multiple conditioned vectors
@@ -418,36 +419,6 @@ class PiBehavior(_model.BaseModel):
             'correction_matrix': correction_matrix,  # Σ_{UO}Σ_{OO}^{-1}
         }
 
-    def encode_predicate_progress(
-        self, 
-        predicate_states: at.Bool[at.Array, "b p"],
-        predicate_mask: at.Bool[at.Array, "b p"],
-    ) -> at.Float[at.Array, "b {self.predicate_encoding_dim}"]:
-        """Encode predicate progress as sincos positional encoding.
-        
-        Progress = num_done_predicates / num_total_predicates
-        
-        Args:
-            predicate_states: [B, P] True = predicate is done
-            predicate_mask: [B, P] True = predicate is valid for this task
-            
-        Returns:
-            Positional encodings [B, 1024]
-        """
-        # Count done and total predicates
-        num_done = jnp.sum(predicate_states & predicate_mask, axis=-1).astype(jnp.float32)  # [B]
-        num_total = jnp.sum(predicate_mask, axis=-1).astype(jnp.float32)  # [B]
-        
-        # Progress: 0.0 = nothing done, 1.0 = all done
-        progress = num_done / jnp.maximum(num_total, 1.0)  # [B]
-        
-        return posemb_sincos(
-            progress, 
-            self.predicate_encoding_dim, 
-            min_period=1e-3, 
-            max_period=1.0
-        )
-
     def aggregate_predicate_embeddings(
         self,
         task_ids: at.Int[at.Array, " b"],
@@ -513,6 +484,8 @@ class PiBehavior(_model.BaseModel):
         """Fuse task embedding with predicate states using multiple representations.
         
         Uses multi-label predicates where each predicate indicates if an object is done.
+        All representations are fully task-specific - done_agg and remaining_agg come from
+        task-specific predicate embeddings, so "3 done" means different things for different tasks.
         
         Returns multiple vectors differently conditioned by predicate states:
         1. Task-gated representation (task embedding modulated by predicates)
@@ -531,26 +504,23 @@ class PiBehavior(_model.BaseModel):
         Returns:
             Multiple fused embeddings [b, 4, 2048]
         """
-        # Get predicate representations
-        progress_encoding = self.encode_predicate_progress(predicate_states, predicate_mask)  # [b, 1024]
+        # Get task-specific predicate aggregations
+        # These are mean-pooled from task_predicate_embeddings, so fully task-specific
         done_agg, remaining_agg = self.aggregate_predicate_embeddings(
             task_ids, predicate_states, predicate_mask
         )  # [b, 1024], [b, 1024]
         
-        # Concatenate inputs for gating: task (2048) + progress (1024) + done (1024) + remaining (1024) = 5120
-        # But we need to match the existing fusion_input_dim = 4096
-        # So we use: task (2048) + progress (1024) + (done + remaining mean) (1024) = 4096
-        combined_predicate_agg = (done_agg + remaining_agg) / 2.0  # [b, 1024]
-        
+        # Concatenate inputs for gating: task (2048) + done_agg (1024) + remaining_agg (1024) = 4096
+        # All components are task-specific!
         all_inputs = jnp.concatenate([
-            task_embedding,        # [b, 2048]
-            progress_encoding,     # [b, 1024]
-            combined_predicate_agg # [b, 1024]
+            task_embedding,  # [b, 2048]
+            done_agg,        # [b, 1024] - task-specific "what's done" embedding
+            remaining_agg    # [b, 1024] - task-specific "what's left" embedding
         ], axis=-1)  # [b, 4096]
         
         # Learn gates for each component (sigmoid to get 0-1 scaling)
-        gate_progress = nnx.sigmoid(self.gate_sincos(all_inputs))      # [b, 1024]
-        gate_predicate = nnx.sigmoid(self.gate_predicate(all_inputs))  # [b, 1024]
+        gate_done = nnx.sigmoid(self.gate_done(all_inputs))            # [b, 1024]
+        gate_remaining = nnx.sigmoid(self.gate_remaining(all_inputs))  # [b, 1024]
         gate_task = nnx.sigmoid(self.gate_task(all_inputs))            # [b, 2048]
         
         # 1. Task-gated representation: task embedding modulated by predicate info [b, 2048]
@@ -563,13 +533,13 @@ class PiBehavior(_model.BaseModel):
         
         # 3. Remaining-focus: what to manipulate next [b, 2048]
         gated_remaining = jnp.concatenate([
-            progress_encoding * gate_progress,  # [b, 1024]
-            remaining_agg * gate_predicate      # [b, 1024]
+            done_agg * gate_done,           # [b, 1024] - gated done context
+            remaining_agg * gate_remaining  # [b, 1024] - gated remaining focus
         ], axis=-1)  # [b, 2048]
         remaining_focus = self.predicate_projection(gated_remaining)  # [b, 2048]
         
-        # 4. Done-focus: what to avoid (pure done + progress) [b, 2048]
-        done_focus = jnp.concatenate([progress_encoding, done_agg], axis=-1)  # [b, 2048]
+        # 4. Done-focus: what to avoid [b, 2048]
+        done_focus = jnp.concatenate([done_agg, remaining_agg], axis=-1)  # [b, 2048]
         
         # Stack all four representations [b, 4, 2048]
         fused_embeddings = jnp.stack([task_gated, balanced_fusion, remaining_focus, done_focus], axis=1)

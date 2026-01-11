@@ -272,6 +272,8 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader.
     num_workers: int = 2
+    # Number of batches each worker prefetches (higher = more memory, faster loading).
+    prefetch_factor: int = 4
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -376,7 +378,7 @@ _CONFIGS = [
         num_train_steps=200_000,
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
         checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
-        num_workers=32, # for torch or grain total
+        num_workers=64, # for torch or grain total
         save_interval=500,
         keep_period=2000,
     ),

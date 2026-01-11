@@ -8,11 +8,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import errno
 import logging
+import os
 import shutil
 from typing import Protocol
 
 from etils import epath
+from etils.epath import backend as epath_backend
 import flax.traverse_util
 import jax
 import flax.nnx as nnx
@@ -21,6 +24,24 @@ import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
+
+
+# Monkey-patch epath backend to handle cross-device rename
+_original_rename = epath_backend.os_backend.rename
+
+def _patched_rename(path, dst):
+    """Rename that falls back to shutil.move for cross-device links."""
+    try:
+        os.rename(path, dst)
+    except OSError as e:
+        if e.errno == errno.EXDEV:  # Cross-device link
+            # Use shutil.move which does copy+delete across filesystems
+            shutil.move(path, dst)
+        else:
+            raise
+
+epath_backend.os_backend.rename = _patched_rename
+
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
@@ -56,10 +77,11 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            max_to_keep=2,
             keep_period=keep_period,
             create=False,
-            async_options=ocp.AsyncOptions(timeout_secs=7200),
+            enable_async_checkpointing=False,
+            # async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )
 
