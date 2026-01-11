@@ -332,7 +332,7 @@ class TrainConfig:
 _CONFIGS = [
     TrainConfig(
         name="pi_behavior_b1k_fast",
-        exp_name="b1k_predicate",
+        exp_name="b1k_predicate_ckpt_1_rand",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
@@ -357,20 +357,21 @@ _CONFIGS = [
                 prompt_from_task=False,  # No text prompts for PI_BEHAVIOR
                 behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
                 use_per_timestamp_norm=True,  # Enable per-timestamp normalization
-                episodes_index=list(range(100)),  # First 100 episodes per task (faster loading)
+                # episodes_index=list(range(100)),  # First 100 episodes per task (faster loading)
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,  # Enable FAST tokenization in data pipeline
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
-            peak_lr=1e-4,
+            peak_lr=1e-5,
             decay_steps=20_000,
             decay_lr=1e-5,
         ),
         num_flow_samples=15,
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "/vast/projects/kumar/lab/yishao/checkpoints_50/pi_behavior_b1k_fast/behavior_50t_checkpoint/1/params"
+            # "/vast/projects/kumar/lab/yishao/checkpoints_50/pi_behavior_b1k_fast/behavior_50t_checkpoint/1/params"
+            "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params"
         ),
         num_train_steps=200_000,
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
