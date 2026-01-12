@@ -126,6 +126,9 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
         'gate_predicate', 
         'task_predicate_embeddings',
         'predicate_pred_from_vlm',
+        'gate_done',       # Gated fusion for done predicates
+        'gate_remaining',  # Gated fusion for remaining predicates
+        'gate_task',       # Gated fusion for task embedding
     ]
     
     def filter_predicate_keys(params_dict):

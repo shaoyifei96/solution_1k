@@ -273,7 +273,7 @@ class TrainConfig:
     # Number of workers to use for the data loader.
     num_workers: int = 2
     # Number of batches each worker prefetches (higher = more memory, faster loading).
-    prefetch_factor: int = 4
+    prefetch_factor: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -334,7 +334,7 @@ class TrainConfig:
 _CONFIGS = [
     TrainConfig(
         name="pi_behavior_b1k_fast",
-        exp_name="b1k_predicate_ckpt_1_rand",
+        exp_name="b1k_predicate_ckpt_1_rand_higher_lr",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
@@ -366,7 +366,7 @@ _CONFIGS = [
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
-            peak_lr=1e-5,
+            peak_lr=3.17e-5,
             decay_steps=20_000,
             decay_lr=1e-5,
         ),
