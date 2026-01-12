@@ -131,6 +131,12 @@ class B1kInputs(transforms.DataTransformFn):
                 padding = np.zeros(initial_actions.shape[:-1] + (padding_dim,))
                 initial_actions = np.concatenate([initial_actions, padding], axis=-1)
             inputs["initial_actions"] = initial_actions
+            
+        # Preserve predicate states for PI_BEHAVIOR model (predicate-based conditioning)
+        if "predicate_states" in data:
+            inputs["predicate_states"] = data["predicate_states"]
+        if "predicate_mask" in data:
+            inputs["predicate_mask"] = data["predicate_mask"]
 
         return inputs
 
@@ -138,10 +144,14 @@ class B1kInputs(transforms.DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class B1kOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
-        # Return actions (truncated to 23 dims) and preserve subtask predictions
+        # Return actions (truncated to 23 dims) and preserve subtask/predicate predictions
         result = {"actions": np.asarray(data["actions"][:, :23])}
         
-        # Preserve subtask prediction fields for PI_BEHAVIOR models
+        # Preserve predicate logits for predicate-based models
+        if "predicate_logits" in data:
+            result["predicate_logits"] = data["predicate_logits"]
+        
+        # Preserve subtask prediction fields for backward compatibility / stage-based models
         if "subtask_logits" in data:
             result["subtask_logits"] = data["subtask_logits"]
         if "predicted_stage" in data:

@@ -1,15 +1,18 @@
-"""B1K policy wrapper with action compression, rolling inpainting, and stage voting."""
+"""B1K policy wrapper with action compression, rolling inpainting, and predicate consensus voting."""
 
 import logging
+import os
+import pickle
 import numpy as np
 import torch
 import dataclasses
 from collections import deque
+from typing import Dict, List, Optional
 
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
-from b1k.models.pi_behavior_config import TASK_NUM_PREDICATES
+from b1k.models.pi_behavior_config import TASK_NUM_PREDICATES, MAX_NUM_PREDICATES
 from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
 from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 
@@ -24,15 +27,23 @@ class B1KWrapperConfig:
     actions_to_execute: int = 26
     actions_to_keep: int = 4
     execute_in_n_steps: int = 20
-    history_len: int = 3
-    votes_to_promote: int = 2
     time_threshold_inpaint: float = 0.3
     num_steps: int = 20
     apply_eval_tricks: bool = True
+    
+    # Predicate consensus settings
+    predicate_data_path: str = "data/predicate_data"  # Path to predicate pkl files
+    predicate_history_len: int = 3  # Number of predictions to consider for consensus
+    predicate_votes_to_done: int = 2  # Votes needed to transition predicate 0→1
+    predicate_allow_backward: bool = True  # Allow predicates to go back 1→0
+    predicate_votes_to_undo: int = 3  # Votes needed to transition predicate 1→0 (if allowed)
 
 
 class B1KPolicyWrapper():
-    """B1K policy wrapper for PI_BEHAVIOR models with action compression, rolling inpainting, and stage voting."""
+    """B1K policy wrapper for PI_BEHAVIOR models with action compression, rolling inpainting, and predicate consensus voting."""
+    
+    # Class-level cache for predicate names per task
+    _predicate_names_cache: Dict[int, List[str]] = {}
     
     def __init__(
         self, 
@@ -58,8 +69,19 @@ class B1KPolicyWrapper():
         
         # PI_BEHAVIOR specific (always True for B1K)
         self.task_id = task_id
-        self.current_stage = 0
-        self.prediction_history = deque([], maxlen=self.config.history_len)
+        
+        # Predicate consensus state
+        # current_predicate_states: [MAX_NUM_PREDICATES] bool array, True = object is done
+        self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+        # Per-predicate prediction history: list of deques, one per predicate
+        self.predicate_prediction_history = [
+            deque([], maxlen=self.config.predicate_history_len)
+            for _ in range(MAX_NUM_PREDICATES)
+        ]
+        # Predicate names for current task (loaded from pkl files)
+        self.predicate_names: List[str] = []
+        if task_id is not None:
+            self._load_predicate_names(task_id)
         
         # Control loop variables
         self.last_actions = None
@@ -76,9 +98,68 @@ class B1KPolicyWrapper():
         self.step_count = 0
         self.prediction_count = 0
         self.next_initial_actions = None
-        self.current_stage = 0
-        self.prediction_history.clear()
+        # Reset predicate consensus state
+        self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+        for hist in self.predicate_prediction_history:
+            hist.clear()
         logger.info(f"Policy reset - Task ID: {self.task_id}, Action horizon: {self.action_horizon}")
+    
+    def _load_predicate_names(self, task_id: int) -> None:
+        """Load predicate names from the task's state_action_vectors.pkl file."""
+        if task_id in B1KPolicyWrapper._predicate_names_cache:
+            self.predicate_names = B1KPolicyWrapper._predicate_names_cache[task_id]
+            return
+        
+        pkl_path = os.path.join(
+            self.config.predicate_data_path, 
+            f"task_{task_id:04d}_state_action_vectors.pkl"
+        )
+        
+        if not os.path.exists(pkl_path):
+            logger.warning(f"Predicate data file not found: {pkl_path}")
+            self.predicate_names = [f"predicate_{i}" for i in range(TASK_NUM_PREDICATES[task_id])]
+            return
+        
+        try:
+            with open(pkl_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            # index_to_item: {0: 'item_name:object', 1: 'item_name:object', ...}
+            index_to_item = data.get('index_to_item', {})
+            num_items = data.get('num_items', 0)
+            
+            # Build ordered list of predicate names
+            self.predicate_names = []
+            for i in range(num_items):
+                name = index_to_item.get(i, f"predicate_{i}")
+                # Clean up the name (remove ':object' suffix if present)
+                if name.endswith(':object'):
+                    name = name[:-7]
+                self.predicate_names.append(name)
+            
+            # Cache for future use
+            B1KPolicyWrapper._predicate_names_cache[task_id] = self.predicate_names
+            
+            logger.info(f"Loaded {len(self.predicate_names)} predicate names for task {task_id}: {self.predicate_names}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to load predicate names from {pkl_path}: {e}")
+            self.predicate_names = [f"predicate_{i}" for i in range(TASK_NUM_PREDICATES[task_id])]
+    
+    def format_predicate_states(self) -> str:
+        """Format current predicate states with names for logging."""
+        if self.task_id is None:
+            return "No task"
+        
+        num_predicates = TASK_NUM_PREDICATES[self.task_id]
+        parts = []
+        for i in range(num_predicates):
+            name = self.predicate_names[i] if i < len(self.predicate_names) else f"pred_{i}"
+            state = "✓" if self.current_predicate_states[i] else "✗"
+            parts.append(f"{name}:{state}")
+        
+        done_count = int(np.sum(self.current_predicate_states[:num_predicates]))
+        return f"[{done_count}/{num_predicates}] " + " | ".join(parts)
     
     def _handle_task_change(self, new_task_id):
         """Handle task ID change by switching checkpoint and resetting state."""
@@ -88,6 +169,9 @@ class B1KPolicyWrapper():
             
             logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (predicates: {TASK_NUM_PREDICATES[new_task_id]})")
             
+            # Load predicate names for new task
+            self._load_predicate_names(new_task_id)
+            
             if self.checkpoint_switcher:
                 new_policy = self.checkpoint_switcher.get_policy_for_task(new_task_id)
                 if new_policy is not self.policy:
@@ -96,8 +180,10 @@ class B1KPolicyWrapper():
                     self.policy = new_policy
                     self.policy.reset()
             
-            self.current_stage = 0
-            self.prediction_history.clear()
+            # Reset predicate consensus state on task change
+            self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+            for hist in self.predicate_prediction_history:
+                hist.clear()
             self.last_actions = None
             self.action_index = 0
             self.next_initial_actions = None
@@ -123,53 +209,74 @@ class B1KPolicyWrapper():
             "prompt": self.text_prompt,
         }
     
-    def update_current_stage(self, predicted_subtask_logits):
-        """Update current stage using majority voting."""
+    def update_predicate_states(self, predicate_logits):
+        """Update predicate states using per-predicate consensus voting.
+        
+        Each predicate independently transitions (not linear progress!):
+        - 0→1 (not done → done): when votes_to_done predictions agree it's done
+        - 1→0 (done → not done): when votes_to_undo predictions agree it's not done (if allowed)
+        
+        Args:
+            predicate_logits: [MAX_NUM_PREDICATES] logits from model (apply sigmoid for probabilities)
+        """
         if self.task_id is None:
             return
-            
+        
         num_predicates = TASK_NUM_PREDICATES[self.task_id]
-        predicted_stage = int(np.argmax(predicted_subtask_logits))
         
-        if predicted_stage > num_predicates - 1:
-            predicted_stage = num_predicates - 1
+        # Apply sigmoid to get binary predictions (threshold at 0.5 = logit 0)
+        predicted_done = predicate_logits > 0  # logit > 0 means sigmoid > 0.5
         
-        self.prediction_history.append(predicted_stage)
-        
-        if len(self.prediction_history) == self.config.history_len:
-            next_stage = self.current_stage + 1
+        # Update each predicate independently
+        for i in range(num_predicates):
+            pred = bool(predicted_done[i])
+            self.predicate_prediction_history[i].append(pred)
             
-            if next_stage <= max_stage:
-                votes_for_next = sum(1 for pred in self.prediction_history if pred == next_stage)
-                votes_to_skip = sum(1 for pred in self.prediction_history if pred == next_stage + 1)
-                votes_to_go_back = sum(1 for pred in self.prediction_history if pred == self.current_stage - 1)
-                
-                if votes_for_next >= self.config.votes_to_promote:
-                    old_stage = self.current_stage
-                    self.current_stage = next_stage
-                    self.prediction_history.clear()
-                    logger.info(f"⬆️  Stage advanced: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-                elif votes_to_skip == self.config.history_len:
-                    old_stage = self.current_stage
-                    self.current_stage = next_stage
-                    self.prediction_history.clear()
-                    logger.info(f"⏭️  Stage skipped: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-                elif votes_to_go_back == self.config.history_len and self.current_stage > 0:
-                    old_stage = self.current_stage
-                    self.current_stage -= 1
-                    self.prediction_history.clear()
-                    logger.info(f"⬅️  Stage went back: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
+            history = self.predicate_prediction_history[i]
+            if len(history) < self.config.predicate_history_len:
+                continue
+            
+            # Count votes for done (True) and not done (False)
+            votes_done = sum(1 for p in history if p)
+            votes_not_done = len(history) - votes_done
+            
+            # Get predicate name for logging
+            pred_name = self.predicate_names[i] if i < len(self.predicate_names) else f"pred_{i}"
+            
+            if not self.current_predicate_states[i]:
+                # Currently not done (0), check if should transition to done (1)
+                if votes_done >= self.config.predicate_votes_to_done:
+                    self.current_predicate_states[i] = True
+                    self.predicate_prediction_history[i].clear()
+                    logger.info(f"✅ [{pred_name}] → DONE (task {self.task_id}, step {self.step_count})")
+                    logger.info(f"   Current: {self.format_predicate_states()}")
+            else:
+                # Currently done (1), check if should transition back to not done (0)
+                if self.config.predicate_allow_backward:
+                    if votes_not_done >= self.config.predicate_votes_to_undo:
+                        self.current_predicate_states[i] = False
+                        self.predicate_prediction_history[i].clear()
+                        logger.info(f"↩️  [{pred_name}] → NOT DONE (task {self.task_id}, step {self.step_count})")
+                        logger.info(f"   Current: {self.format_predicate_states()}")
     
     def prepare_batch_for_pi_behavior(self, batch):
-        """Prepare batch for PI_BEHAVIOR model by adding task_id and current_stage."""
+        """Prepare batch for PI_BEHAVIOR model by adding task_id and predicate states."""
         task_id = self.task_id if self.task_id is not None else -1
         batch_copy = batch.copy()
         if "prompt" in batch_copy:
             del batch_copy["prompt"]
         
-        batch_copy["tokenized_prompt"] = np.array([task_id, self.current_stage], dtype=np.int32)
-        batch_copy["tokenized_prompt_mask"] = np.array([True, True], dtype=bool)
-        batch_copy["subtask_state"] = np.array(self.current_stage, dtype=np.int32)
+        # Task ID only (no stage - predicates are the state now)
+        batch_copy["tokenized_prompt"] = np.array([task_id], dtype=np.int32)
+        batch_copy["tokenized_prompt_mask"] = np.array([True], dtype=bool)
+        
+        # Add predicate states for predicate-based conditioning
+        num_predicates = TASK_NUM_PREDICATES[task_id] if task_id >= 0 else 1
+        predicate_mask = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+        predicate_mask[:num_predicates] = True
+        
+        batch_copy["predicate_states"] = self.current_predicate_states.copy()
+        batch_copy["predicate_mask"] = predicate_mask
         
         return batch_copy
     
@@ -229,20 +336,14 @@ class B1KPolicyWrapper():
             if self.config.apply_eval_tricks:
                 if self.task_id is not None:
                     actions_before = actions.copy()
-                    actions, corrected_stage = apply_correction_rules(
-                        self.task_id, self.current_stage, current_state, actions
+                    actions, _ = apply_correction_rules(
+                        self.task_id, 0, current_state, actions  # Stage no longer used
                     )
-                    
-                    # Log if stage was corrected
-                    if corrected_stage != self.current_stage:
-                        logger.info(f"🔧 Correction rule: Stage corrected {self.current_stage} → {corrected_stage} (task {self.task_id}, step {self.step_count})")
-                        self.current_stage = corrected_stage
-                        self.prediction_history.clear()
                     
                     # Log if actions were modified
                     if not np.allclose(actions_before, actions, rtol=1e-3):
                         max_diff = np.max(np.abs(actions_before - actions))
-                        logger.info(f"🔧 Correction rule: Actions modified (max diff: {max_diff:.4f}, task {self.task_id}, stage {self.current_stage})")
+                        logger.info(f"🔧 Correction rule: Actions modified (max diff: {max_diff:.4f}, task {self.task_id})")
                 
                 if should_compress:
                     has_high_variation, mean_var, max_var = check_gripper_variation(
@@ -282,9 +383,9 @@ class B1KPolicyWrapper():
                 compression_status = f"compressed {actions_to_execute}→{execute_steps}" if should_compress else f"uncompressed ({execute_steps})"
                 logger.info(f"🎯 Prediction #{self.prediction_count} | Actions: {compression_status} | Inpainting: {self.next_initial_actions is not None}")
             
-            # Update stage based on model predictions
-            if "subtask_logits" in output:
-                self.update_current_stage(output["subtask_logits"])
+            # Update predicate states based on model predictions
+            if "predicate_logits" in output:
+                self.update_predicate_states(output["predicate_logits"])
         
         # Get current action from sequence
         if self.action_index >= len(self.last_actions):
@@ -294,10 +395,9 @@ class B1KPolicyWrapper():
         self.action_index += 1
         self.step_count += 1
         
-        # Log progress every 100 steps
+        # Log progress every 100 steps (with predicate names)
         if self.step_count % 100 == 0:
-            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{TASK_NUM_PREDICATES[self.task_id]-1} | Predictions: {self.prediction_count}")
-        
+            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | {self.format_predicate_states()} | Predictions: {self.prediction_count}")
         # Convert to torch tensor
         action_tensor = torch.from_numpy(current_action).float()
         if len(action_tensor) > 23:

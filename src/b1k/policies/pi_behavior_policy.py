@@ -18,8 +18,10 @@ from b1k.models.observation import Observation  # Use our custom Observation wit
 class PiBehaviorPolicy(Policy):
     """Policy for PiBehavior models - only difference is unpacking the tuple return.
     
-    PiBehavior.sample_actions() returns (actions, subtask_logits) instead of just actions.
+    PiBehavior.sample_actions() returns (actions, predicate_logits) instead of just actions.
     This minimal subclass unpacks the tuple before output transforms are applied.
+    
+    predicate_logits is [B, MAX_NUM_PREDICATES] - apply sigmoid for probabilities.
     """
     
     @override
@@ -93,12 +95,15 @@ class PiBehaviorPolicy(Policy):
         start_time = time.monotonic()
         
         # ONLY DIFFERENCE: Unpack tuple return from PiBehavior.sample_actions
-        actions, subtask_logits = self._sample_actions(sample_rng, observation, **sample_kwargs)
+        # Returns (actions, predicate_logits) where predicate_logits is [B, MAX_NUM_PREDICATES]
+        actions, predicate_logits = self._sample_actions(sample_rng, observation, **sample_kwargs)
         
         outputs = {
             "state": inputs["state"],
             "actions": actions,  # Now an array, not a tuple!
-            "subtask_logits": subtask_logits,
+            "predicate_logits": predicate_logits,  # Multi-label predicate logits
+            # Keep subtask_logits for backward compatibility (same as predicate_logits)
+            "subtask_logits": predicate_logits,
         }
         
         model_time = time.monotonic() - start_time
@@ -112,8 +117,9 @@ class PiBehaviorPolicy(Policy):
         # Apply output transforms (now works because actions is an array)
         outputs = self._output_transform(outputs)
         
-        # Add convenience field
-        outputs["predicted_stage"] = int(np.argmax(outputs["subtask_logits"]))
+        # Add convenience field: number of predicates predicted as "done"
+        # predicate_logits > 0 means sigmoid > 0.5 (predicted done)
+        outputs["predicted_stage"] = int(np.sum(outputs["predicate_logits"] > 0))
         
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,

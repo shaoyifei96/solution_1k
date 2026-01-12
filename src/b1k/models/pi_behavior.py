@@ -536,13 +536,13 @@ class PiBehavior(_model.BaseModel):
             done_agg * gate_done,           # [b, 1024] - gated done context
             remaining_agg * gate_remaining  # [b, 1024] - gated remaining focus
         ], axis=-1)  # [b, 2048]
-        remaining_focus = self.predicate_projection(gated_remaining)  # [b, 2048]
+        gated_predicate_proj = self.predicate_projection(gated_remaining)  # [b, 2048]
         
         # 4. Done-focus: what to avoid [b, 2048]
-        done_focus = jnp.concatenate([done_agg, remaining_agg], axis=-1)  # [b, 2048]
+        raw_predicates = jnp.concatenate([done_agg, remaining_agg], axis=-1)  # [b, 2048]
         
         # Stack all four representations [b, 4, 2048]
-        fused_embeddings = jnp.stack([task_gated, balanced_fusion, remaining_focus, done_focus], axis=1)
+        fused_embeddings = jnp.stack([task_gated, balanced_fusion, gated_predicate_proj, raw_predicates], axis=1)
         
         return fused_embeddings
 
