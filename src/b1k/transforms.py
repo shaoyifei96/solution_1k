@@ -1,7 +1,7 @@
 """Data transforms for BEHAVIOR-1K dataset.
 
 Standard transforms imported from OpenPI.
-B1K-specific: TaskIndexToTaskId, ComputeSubtaskStateFromMeta, TokenizeFASTActions
+B1K-specific: TaskIndexToTaskId, ComputePredicateStateFromData, TokenizeFASTActions
 
 Reference: https://github.com/wensi-ai/openpi/tree/behavior
 """

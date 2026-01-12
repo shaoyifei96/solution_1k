@@ -32,7 +32,7 @@ class B1KWrapperConfig:
     apply_eval_tricks: bool = True
     
     # Predicate consensus settings
-    predicate_data_path: str = "data/predicate_data"  # Path to predicate pkl files
+    predicate_data_path: str = "/vast/projects/kumar/lab/yishao/data/predicate_data/predicate_data"  # Path to predicate pkl files
     predicate_history_len: int = 3  # Number of predictions to consider for consensus
     predicate_votes_to_done: int = 2  # Votes needed to transition predicate 0→1
     predicate_allow_backward: bool = True  # Allow predicates to go back 1→0
@@ -155,7 +155,7 @@ class B1KPolicyWrapper():
         parts = []
         for i in range(num_predicates):
             name = self.predicate_names[i] if i < len(self.predicate_names) else f"pred_{i}"
-            state = "✓" if self.current_predicate_states[i] else "✗"
+            state = "🟢" if self.current_predicate_states[i] else "🔴"
             parts.append(f"{name}:{state}")
         
         done_count = int(np.sum(self.current_predicate_states[:num_predicates]))
@@ -224,13 +224,22 @@ class B1KPolicyWrapper():
         
         num_predicates = TASK_NUM_PREDICATES[self.task_id]
         
-        # Apply sigmoid to get binary predictions (threshold at 0.5 = logit 0)
-        predicted_done = predicate_logits > 0  # logit > 0 means sigmoid > 0.5
+        # Apply sigmoid threshold at 0.8 probability for high confidence transitions
+        # logit = ln(p / (1-p)) = ln(0.8 / 0.2) ≈ 1.386
+        logit_threshold_high = np.log(0.8 / 0.2)  # ~1.386 for sigmoid > 0.8
+        logit_threshold_low = -logit_threshold_high  # ~-1.386 for sigmoid < 0.2
+        
+        predicted_done = predicate_logits > logit_threshold_high  # sigmoid > 0.8 → confident done
+        predicted_not_done = predicate_logits < logit_threshold_low  # sigmoid < 0.2 → confident not done
         
         # Update each predicate independently
         for i in range(num_predicates):
-            pred = bool(predicted_done[i])
-            self.predicate_prediction_history[i].append(pred)
+            # Track high-confidence predictions only
+            if predicted_done[i]:
+                self.predicate_prediction_history[i].append(True)
+            elif predicted_not_done[i]:
+                self.predicate_prediction_history[i].append(False)
+            # If neither threshold met, don't add to history (uncertain prediction)
             
             history = self.predicate_prediction_history[i]
             if len(history) < self.config.predicate_history_len:
@@ -379,9 +388,9 @@ class B1KPolicyWrapper():
             self.prediction_count += 1
             
             # Log prediction details (at lower frequency, every 10 predictions)
-            if self.prediction_count % 10 == 0:
-                compression_status = f"compressed {actions_to_execute}→{execute_steps}" if should_compress else f"uncompressed ({execute_steps})"
-                logger.info(f"🎯 Prediction #{self.prediction_count} | Actions: {compression_status} | Inpainting: {self.next_initial_actions is not None}")
+            # if self.prediction_count % 10 == 0:
+            #     compression_status = f"compressed {actions_to_execute}→{execute_steps}" if should_compress else f"uncompressed ({execute_steps})"
+            #     logger.info(f"🎯 Prediction #{self.prediction_count} | Actions: {compression_status} | Inpainting: {self.next_initial_actions is not None}")
             
             # Update predicate states based on model predictions
             if "predicate_logits" in output:
@@ -395,8 +404,8 @@ class B1KPolicyWrapper():
         self.action_index += 1
         self.step_count += 1
         
-        # Log progress every 100 steps (with predicate names)
-        if self.step_count % 100 == 0:
+        # Log progress every 500 steps (with predicate names)
+        if self.step_count % 500 == 0:
             logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | {self.format_predicate_states()} | Predictions: {self.prediction_count}")
         # Convert to torch tensor
         action_tensor = torch.from_numpy(current_action).float()

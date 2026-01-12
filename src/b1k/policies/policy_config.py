@@ -76,7 +76,10 @@ def create_trained_policy(
     model_transforms_inputs = []
     for transform in data_config.model_transforms.inputs:
         # Skip training-specific transforms during inference
-        if isinstance(transform, (b1k_transforms.ComputeSubtaskStateFromMeta, b1k_transforms.TaskIndexToTaskId, b1k_transforms.TokenizeFASTActions)):
+        # ComputePredicateStateFromData: requires episode_index/timestamp from training data
+        # TaskIndexToTaskId: task_id is set directly during inference
+        # TokenizeFASTActions: FAST tokenization is training-only
+        if isinstance(transform, (b1k_transforms.ComputePredicateStateFromData, b1k_transforms.TaskIndexToTaskId, b1k_transforms.TokenizeFASTActions)):
             continue
         model_transforms_inputs.append(transform)
     

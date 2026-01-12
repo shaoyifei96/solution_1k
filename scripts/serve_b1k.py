@@ -74,8 +74,8 @@ class Args:
     actions_to_execute: int = 26
     actions_to_keep: int = 4
     execute_in_n_steps: int = 20
-    history_len: int = 3
-    votes_to_promote: int = 2
+    history_len: int = 5
+    votes_to_promote: int = 4
     time_threshold_inpaint: float = 0.3
     num_steps: int = 20
     apply_eval_tricks: bool = True  # Enable correction rules and gripper variation checks
@@ -144,8 +144,8 @@ def main(args: Args) -> None:
         actions_to_execute=args.actions_to_execute,
         actions_to_keep=args.actions_to_keep,
         execute_in_n_steps=args.execute_in_n_steps,
-        history_len=args.history_len,
-        votes_to_promote=args.votes_to_promote,
+        predicate_history_len=args.history_len,
+        predicate_votes_to_done=args.votes_to_promote,
         time_threshold_inpaint=args.time_threshold_inpaint,
         num_steps=args.num_steps,
         apply_eval_tricks=args.apply_eval_tricks,
