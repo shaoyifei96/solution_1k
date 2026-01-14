@@ -207,8 +207,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     ]
     
     # Select specific task indices
-    tasks = [tasks[i] for i in [2, 3, 5, 6, 10, 11, 13, 14, 15, 19, 23, 24, 25, 28, 29, 34, 42, 44, 47, 48]]
-    
+    # tasks = [tasks[i] for i in [2, 3, 5, 6, 10, 11, 13, 14, 15, 19, 23, 24, 25, 28, 29, 34, 42, 44, 47, 48]]
     
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,

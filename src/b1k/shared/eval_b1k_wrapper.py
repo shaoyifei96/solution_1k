@@ -1,8 +1,13 @@
 """B1K policy wrapper with action compression, rolling inpainting, and predicate consensus voting."""
 
+import json
 import logging
 import os
 import pickle
+import time
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import torch
 import dataclasses
@@ -37,6 +42,11 @@ class B1KWrapperConfig:
     predicate_votes_to_done: int = 2  # Votes needed to transition predicate 0→1
     predicate_allow_backward: bool = True  # Allow predicates to go back 1→0
     predicate_votes_to_undo: int = 3  # Votes needed to transition predicate 1→0 (if allowed)
+    
+    # Predicate logging settings (for evaluation analysis)
+    log_predicates: bool = False  # Enable predicate logging
+    predicate_log_dir: str = "predicate_logs"  # Directory to save predicate logs
+    predicate_log_prefix: str = ""  # Prefix for log file names (e.g., task name)
 
 
 class B1KPolicyWrapper():
@@ -89,9 +99,17 @@ class B1KPolicyWrapper():
         self.step_count = 0
         self.prediction_count = 0
         self.next_initial_actions = None
+        
+        # Predicate logging data structure
+        self.predicate_log: List[Dict] = []  # Accumulated predicate history
+        self._log_start_time = time.time()
     
     def reset(self):
         """Reset policy state."""
+        # Save predicate log before reset if logging is enabled and there's data
+        if self.config.log_predicates and len(self.predicate_log) > 0:
+            self.save_predicate_log()
+        
         self.policy.reset()
         self.last_actions = None
         self.action_index = 0
@@ -102,6 +120,9 @@ class B1KPolicyWrapper():
         self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
         for hist in self.predicate_prediction_history:
             hist.clear()
+        # Reset predicate logging
+        self.predicate_log = []
+        self._log_start_time = time.time()
         logger.info(f"Policy reset - Task ID: {self.task_id}, Action horizon: {self.action_horizon}")
     
     def _load_predicate_names(self, task_id: int) -> None:
@@ -160,6 +181,142 @@ class B1KPolicyWrapper():
         
         done_count = int(np.sum(self.current_predicate_states[:num_predicates]))
         return f"[{done_count}/{num_predicates}] " + " | ".join(parts)
+    
+    def log_predicate_entry(
+        self, 
+        predicate_logits: Optional[np.ndarray] = None,
+        predicate_probs: Optional[np.ndarray] = None,
+    ) -> None:
+        """Log a predicate prediction entry.
+        
+        Args:
+            predicate_logits: Raw logits from the model [MAX_NUM_PREDICATES]
+            predicate_probs: Sigmoid probabilities (computed if not provided)
+        """
+        if not self.config.log_predicates:
+            return
+        
+        num_predicates = TASK_NUM_PREDICATES[self.task_id] if self.task_id is not None and 0 <= self.task_id < len(TASK_NUM_PREDICATES) else 0
+        
+        entry = {
+            "step": self.step_count,
+            "prediction_idx": self.prediction_count,
+            "timestamp": time.time() - self._log_start_time,
+            "task_id": self.task_id,
+            "num_predicates": num_predicates,
+            # States used as model INPUT (before this prediction updates them)
+            "input_predicate_states": self.current_predicate_states[:num_predicates].tolist(),
+            "input_predicate_states_full": self.current_predicate_states.tolist(),
+        }
+        
+        # Add model outputs
+        if predicate_logits is not None:
+            entry["output_logits"] = predicate_logits[:num_predicates].tolist()
+            entry["output_logits_full"] = predicate_logits.tolist()
+            
+            if predicate_probs is None:
+                predicate_probs = 1 / (1 + np.exp(-predicate_logits))  # Sigmoid
+            entry["output_probs"] = predicate_probs[:num_predicates].tolist()
+            entry["output_probs_full"] = predicate_probs.tolist()
+        
+        # Add predicate names for easier analysis
+        if self.predicate_names:
+            entry["predicate_names"] = self.predicate_names[:num_predicates]
+        
+        self.predicate_log.append(entry)
+    
+    def save_predicate_log(self, filepath: Optional[str] = None) -> str:
+        """Save accumulated predicate log to a file.
+        
+        Args:
+            filepath: Optional custom path. If None, uses config settings.
+            
+        Returns:
+            Path to the saved file.
+        """
+        if len(self.predicate_log) == 0:
+            logger.warning("No predicate log entries to save")
+            return ""
+        
+        # Build filepath
+        if filepath is None:
+            log_dir = Path(self.config.predicate_log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            prefix = f"{self.config.predicate_log_prefix}_" if self.config.predicate_log_prefix else ""
+            task_str = f"task{self.task_id}" if self.task_id is not None else "notask"
+            filename = f"{prefix}{task_str}_{timestamp}.json"
+            filepath = log_dir / filename
+        else:
+            filepath = Path(filepath)
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Build log data with metadata
+        log_data = {
+            "metadata": {
+                "task_id": self.task_id,
+                "predicate_names": self.predicate_names,
+                "num_predicates": TASK_NUM_PREDICATES[self.task_id] if self.task_id is not None and 0 <= self.task_id < len(TASK_NUM_PREDICATES) else 0,
+                "total_steps": self.step_count,
+                "total_predictions": self.prediction_count,
+                "config": {
+                    "predicate_history_len": self.config.predicate_history_len,
+                    "predicate_votes_to_done": self.config.predicate_votes_to_done,
+                    "predicate_allow_backward": self.config.predicate_allow_backward,
+                    "predicate_votes_to_undo": self.config.predicate_votes_to_undo,
+                    "actions_to_execute": self.config.actions_to_execute,
+                    "execute_in_n_steps": self.config.execute_in_n_steps,
+                },
+                "saved_at": datetime.now().isoformat(),
+            },
+            "entries": self.predicate_log,
+        }
+        
+        with open(filepath, 'w') as f:
+            json.dump(log_data, f, indent=2)
+        
+        logger.info(f"💾 Saved predicate log: {filepath} ({len(self.predicate_log)} entries)")
+        return str(filepath)
+    
+    def get_predicate_log_dataframe(self):
+        """Convert predicate log to pandas DataFrame for analysis.
+        
+        Returns:
+            pandas.DataFrame with predicate history, or None if pandas not available.
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            logger.warning("pandas not available for DataFrame conversion")
+            return None
+        
+        if len(self.predicate_log) == 0:
+            return pd.DataFrame()
+        
+        # Flatten entries for DataFrame
+        rows = []
+        for entry in self.predicate_log:
+            row = {
+                "step": entry["step"],
+                "prediction_idx": entry["prediction_idx"],
+                "timestamp": entry["timestamp"],
+                "task_id": entry["task_id"],
+            }
+            
+            # Add per-predicate columns
+            num_preds = entry.get("num_predicates", 0)
+            names = entry.get("predicate_names", [f"pred_{i}" for i in range(num_preds)])
+            
+            for i in range(num_preds):
+                name = names[i] if i < len(names) else f"pred_{i}"
+                row[f"input_{name}"] = entry["input_predicate_states"][i] if i < len(entry.get("input_predicate_states", [])) else None
+                row[f"prob_{name}"] = entry["output_probs"][i] if "output_probs" in entry and i < len(entry["output_probs"]) else None
+                row[f"logit_{name}"] = entry["output_logits"][i] if "output_logits" in entry and i < len(entry["output_logits"]) else None
+            
+            rows.append(row)
+        
+        return pd.DataFrame(rows)
     
     def _handle_task_change(self, new_task_id):
         """Handle task ID change by switching checkpoint and resetting state."""
@@ -394,6 +551,8 @@ class B1KPolicyWrapper():
             
             # Update predicate states based on model predictions
             if "predicate_logits" in output:
+                # Log BEFORE updating states (so we capture input states and output predictions)
+                self.log_predicate_entry(predicate_logits=output["predicate_logits"])
                 self.update_predicate_states(output["predicate_logits"])
         
         # Get current action from sequence

@@ -77,7 +77,7 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=2,
+            max_to_keep=10,
             keep_period=keep_period,
             create=False,
             enable_async_checkpointing=False,

@@ -252,7 +252,7 @@ class TrainConfig:
     # Note: PyTorch support removed - JAX only
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
-    optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
+    optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)##muon optimizer 1e-4 1e-5
     ema_decay: float | None = 0.99
 
     # Specifies which weights should be frozen.
@@ -334,7 +334,7 @@ class TrainConfig:
 _CONFIGS = [
     TrainConfig(
         name="pi_behavior_b1k_fast",
-        exp_name="b1k_predicate_ckpt_1_rand_higher_lr",
+        exp_name="b1k_predicate_ckpt_50t",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
@@ -366,19 +366,20 @@ _CONFIGS = [
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
-            peak_lr=3.17e-5,
+            peak_lr=1e-5,
             decay_steps=20_000,
             decay_lr=1e-5,
         ),
         num_flow_samples=15,
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            # "/vast/projects/kumar/lab/yishao/checkpoints_50/pi_behavior_b1k_fast/behavior_50t_checkpoint/1/params"
-            "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params"
+            # "/vast/projects/kumar/lab/yishao/checkpoints_50/pi_behavior_b1k_fast/behavior_50t_checkpoint/1/params" # trained 50 task with stage
+            # "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params" # finetuned 20 tasks 
+            "gs://openpi-assets/checkpoints/pi05_base/params" # pi0 base weights
         ),
         num_train_steps=200_000,
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
         checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
-        num_workers=64, # for torch or grain total
+        num_workers=75, # for torch or grain total
         save_interval=500,
         keep_period=2000,
     ),

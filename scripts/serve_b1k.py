@@ -82,6 +82,11 @@ class Args:
     
     # Multi-checkpoint support for PI_BEHAVIOR models (optional)
     task_checkpoint_mapping: str | None = None  # Path to task-checkpoint mapping JSON file
+    
+    # Predicate logging for evaluation analysis
+    log_predicates: bool = False  # Enable predicate state/prediction logging
+    predicate_log_dir: str = "predicate_logs"  # Directory to save predicate logs
+    predicate_log_prefix: str = ""  # Prefix for log file names (e.g., task name or run ID)
 
 
 def create_policy(args: Args) -> _policy.Policy:
@@ -149,6 +154,9 @@ def main(args: Args) -> None:
         time_threshold_inpaint=args.time_threshold_inpaint,
         num_steps=args.num_steps,
         apply_eval_tricks=args.apply_eval_tricks,
+        log_predicates=args.log_predicates,
+        predicate_log_dir=args.predicate_log_dir,
+        predicate_log_prefix=args.predicate_log_prefix,
     )
     
     logging.info(f"Wrapper config: execute={wrapper_config.actions_to_execute}, keep={wrapper_config.actions_to_keep}, steps={wrapper_config.execute_in_n_steps}, num_steps={wrapper_config.num_steps}")
@@ -157,6 +165,11 @@ def main(args: Args) -> None:
         logging.info("Eval tricks ENABLED - correction rules and gripper variation checks active")
     else:
         logging.info("Eval tricks DISABLED (default behavior)")
+    
+    if wrapper_config.log_predicates:
+        logging.info(f"Predicate logging ENABLED - logs will be saved to: {wrapper_config.predicate_log_dir}")
+    else:
+        logging.info("Predicate logging disabled")
 
     # Create B1K wrapper with PI_BEHAVIOR-specific features
     policy = B1KPolicyWrapper(
