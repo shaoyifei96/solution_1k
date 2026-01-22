@@ -24,6 +24,11 @@ from omnigibson.macros import gm
 from omnigibson.utils.config_utils import TorchEncoder
 import omnigibson as og
 
+from bddl.condition_evaluation import (
+        NQuantifier, Universal, Existential, Conjunction, Disjunction,
+        Negation, HEAD, ForPairs, ForNPairs
+    )
+from bddl.logic_base import BinaryAtomicFormula, UnaryAtomicFormula
 # Disable rendering for speed
 gm.RENDER_VIEWER_CAMERA = False
 gm.DEFAULT_VIEWER_WIDTH = 1280
@@ -32,6 +37,117 @@ gm.HEADLESS = True
 
 # Disable transition rules for playback
 gm.ENABLE_TRANSITION_RULES = False
+
+
+# =============================================================================
+# Helper functions for BDDL body parsing
+# =============================================================================
+
+def body_to_name(body):
+    """Convert BDDL body to a readable name like 'inside(obj1, obj2)'."""
+    def flatten(x):
+        if isinstance(x, (list, tuple)):
+            if len(x) == 0:
+                return ''
+            # First element is predicate name, rest are arguments
+            pred_name = str(x[0])
+            args = [str(a).lstrip('?') for a in x[1:] if a]
+            if args:
+                return f"{pred_name}({', '.join(args)})"
+            return pred_name
+        return str(x).lstrip('?')
+    return flatten(body)
+
+
+def get_category(body):
+    """Extract the iterator category from body like ['?type.n.01', '-', 'type.n.01']"""
+    if isinstance(body, (list, tuple)) and len(body) >= 1:
+        iterable = body[0]
+        if isinstance(iterable, (list, tuple)) and len(iterable) >= 3:
+            return iterable[2]  # The type, e.g., 'table.n.02'
+    return None
+
+
+def get_category_forn(body):
+    """Extract the iterator category from forn body like [['1'], ['?type', '-', 'type'], ['pred', ...]]"""
+    # forn body: [['N'], ['?type', '-', 'type'], ['predicate', ...]]
+    if isinstance(body, (list, tuple)) and len(body) >= 2:
+        # Skip the count element [['1']]
+        iterable = body[1] if len(body) > 1 else body[0]
+        if isinstance(iterable, (list, tuple)) and len(iterable) >= 3:
+            return iterable[2]  # The type, e.g., 'candy_cane.n.01'
+    return None
+
+
+def get_predicate_info(body):
+    """Extract predicate name and args from body"""
+    if isinstance(body, (list, tuple)) and len(body) >= 2:
+        pred_part = body[1] if len(body) > 1 else body[0]
+        if isinstance(pred_part, (list, tuple)) and len(pred_part) >= 1:
+            pred_name = pred_part[0]
+            args = [str(a).lstrip('?') for a in pred_part[1:] if a]
+            return pred_name, args
+    return None, []
+
+
+def get_predicate_info_forn(body):
+    """Extract predicate name and args from forn body [['N'], ['?type', '-', 'type'], ['predicate', ...]]"""
+    if isinstance(body, (list, tuple)) and len(body) >= 3:
+        pred_part = body[2]  # The predicate is the third element
+        if isinstance(pred_part, (list, tuple)) and len(pred_part) >= 1:
+            pred_name = pred_part[0]
+            args = [str(a).lstrip('?') for a in pred_part[1:] if a]
+            return pred_name, args
+    return None, []
+
+
+def get_param_label(body):
+    """Extract param_label from body for scope lookup"""
+    if isinstance(body, (list, tuple)) and len(body) >= 1:
+        iterable = body[0]
+        if isinstance(iterable, (list, tuple)) and len(iterable) >= 1:
+            if isinstance(iterable[0], str):
+                return iterable[0].strip('?')
+    return None
+
+
+def get_param_label_forn(body):
+    """Extract param_label from forn body [['N'], ['?type', '-', 'type'], ...]"""
+    if isinstance(body, (list, tuple)) and len(body) >= 2:
+        iterable = body[1]
+        if isinstance(iterable, (list, tuple)) and len(iterable) >= 1:
+            if isinstance(iterable[0], str):
+                return iterable[0].strip('?')
+    return None
+
+
+def get_instance_name(child, i, param_label):
+    """
+    Get grounded instance name from child expression.
+    
+    Args:
+        child: Child expression with scope and/or input1
+        i: Index of the child (fallback)
+        param_label: Parameter label for scope lookup (e.g., 'obj' from '?obj')
+    
+    Returns:
+        str: Instance name like 'table.n.02_1' or fallback 'instance_0'
+    """
+    instance_name = f"instance_{i}"
+    if param_label and hasattr(child, 'scope') and isinstance(child.scope, dict):
+        grounded = child.scope.get(param_label)
+        if grounded and isinstance(grounded, str):
+            instance_name = grounded
+        else:
+            # Fallback: search scope for matching key
+            for sk, sv in child.scope.items():
+                if isinstance(sv, str) and param_label and sv.startswith(param_label + '_'):
+                    instance_name = sv
+                    break
+    # If still generic, try input1 for atomic formulas
+    if instance_name.startswith("instance_") and hasattr(child, 'input1'):
+        instance_name = child.input1
+    return instance_name
 
 
 def predicate_to_str(pred):
@@ -74,262 +190,306 @@ def predicate_to_str(pred):
         return repr(pred)
 
 
-def extract_predicate_details(expr, prefix="", expand_instances=False, max_depth=2, 
-                               quantifier_types=None, _current_depth=0):
+def extract_predicate_tree(expr, _current_depth=0, max_depth=10):
     """
-    Recursively extract predicate evaluation details from a BDDL expression tree.
+    Extract predicate evaluation as a proper hierarchical tree structure.
     
-    After evaluate() is called on the expression, child_values contains the evaluation
-    results. This function extracts count/threshold info for quantifiers.
+    Returns a dict representing the predicate tree with all nested quantifiers,
+    counts, instances, and satisfaction status preserved in structure.
     
     Args:
         expr: A BDDL Expression object (HEAD, NQuantifier, Universal, etc.)
-        prefix: Optional prefix for nested expressions
-        expand_instances: If True, include per-instance boolean values (can be many columns)
-        max_depth: Maximum recursion depth for nested expressions (0=no recursion, -1=unlimited)
-        quantifier_types: Set of quantifier types to expand. Options: 
-                         {'forn', 'forall', 'exists', 'fornpairs', 'forpairs', 'and', 'or', 'not'}
-                         Default (None) = {'forn', 'forall', 'exists', 'fornpairs', 'forpairs'}
         _current_depth: Internal counter for recursion depth
+        max_depth: Maximum recursion depth (default: 10)
         
     Returns:
-        dict: Mapping of predicate keys to their evaluation details including:
-            - For simple predicates: just the boolean value
-            - For count predicates (forn, forall, exists): count, threshold, satisfied
+        dict: Hierarchical representation of the predicate, e.g.:
+            {
+                "type": "exists",
+                "category": "table.n.02",
+                "satisfied": True,
+                "count": 1,
+                "total": 2,
+                "threshold": 1,
+                "instances": {
+                    "table.n.02_1": {
+                        "satisfied": True,
+                        "nested": [
+                            {
+                                "type": "forall",
+                                "category": "pillar_candle.n.01",
+                                "predicate": "ontop",
+                                "count": 2,
+                                "threshold": 2,
+                                "satisfied": True
+                            }
+                        ]
+                    }
+                }
+            }
     """
-    from bddl.condition_evaluation import (
-        NQuantifier, Universal, Existential, Conjunction, Disjunction,
-        Negation, HEAD, ForPairs, ForNPairs
-    )
+
     
-    # Default quantifier types to expand
-    if quantifier_types is None:
-        quantifier_types = {'forn', 'forall', 'exists', 'fornpairs', 'forpairs'}
-    
-    # Check depth limit
     if max_depth >= 0 and _current_depth > max_depth:
-        return {}
+        return {"type": "max_depth_reached"}
     
-    results = {}
-    expr_type = type(expr).__name__
+    result = {}
     
-    # Get the base predicate name from body - use human-readable format
-    def body_to_name(body):
-        """Convert BDDL body to a readable name like 'inside(obj1, obj2)'."""
-        def flatten(x):
-            if isinstance(x, (list, tuple)):
-                if len(x) == 0:
-                    return ''
-                # First element is predicate name, rest are arguments
-                pred_name = str(x[0])
-                args = [str(a).lstrip('?') for a in x[1:] if a]
-                if args:
-                    return f"{pred_name}({', '.join(args)})"
-                return pred_name
-            return str(x).lstrip('?')
-        return flatten(body)
+    def iterate_children_with_recursion(expr, param_label, skip_atomic=True):
+        """
+        Shared child iteration logic for quantifiers (forall, exists, forn).
+        Returns a dict mapping instance_name -> instance_data with optional nested tree.
+        
+        Args:
+            expr: The quantifier expression with children and child_values
+            param_label: The parameter label for scope lookup (e.g., 'obj' from '?obj')
+            skip_atomic: If True, skip adding 'nested' for atomic predicates
+        """
+        instances = {}
+        if not expr.children:
+            return instances
+        
+        for i, child in enumerate(expr.children):
+            # Get grounded instance name from scope or input1
+            instance_name = f"instance_{i}"
+            if param_label and hasattr(child, 'scope') and isinstance(child.scope, dict):
+                grounded = child.scope.get(param_label)
+                if grounded and isinstance(grounded, str):
+                    instance_name = grounded
+                else:
+                    # Fallback: search scope for matching key
+                    for sk, sv in child.scope.items():
+                        if isinstance(sv, str) and param_label and sv.startswith(param_label + '_'):
+                            instance_name = sv
+                            break
+            # If still generic, try input1 for atomic formulas
+            if instance_name.startswith("instance_") and hasattr(child, 'input1'):
+                instance_name = child.input1
+            
+            # Store per-instance satisfaction
+            instance_data = {
+                "satisfied": bool(expr.child_values[i]) if expr.child_values and i < len(expr.child_values) else False
+            }
+            
+            # Recurse into nested quantifiers
+            nested = extract_predicate_tree(child, _current_depth + 1, max_depth)
+            skip_types = ["empty_head", "max_depth_reached", None]
+            if skip_atomic:
+                skip_types.append("atomic")
+            if nested and nested.get("type") not in skip_types:
+                instance_data["nested"] = nested
+            
+            instances[instance_name] = instance_data
+        
+        return instances
     
-    # Handle different expression types
     if isinstance(expr, HEAD):
         # HEAD wraps a single child expression
         child = expr.children[0] if expr.children else None
         if child is not None:
-            child_results = extract_predicate_details(
-                child, prefix, expand_instances, max_depth, quantifier_types, _current_depth
-            )
-            results.update(child_results)
-            
-            # Also store the overall HEAD evaluation
-            pred_name = body_to_name(expr.body)
-            if pred_name and pred_name not in results:
-                results[pred_name] = bool(expr.child_values[0]) if expr.child_values else None
-                
-    elif isinstance(expr, NQuantifier) and 'forn' in quantifier_types:
+            return extract_predicate_tree(child, _current_depth, max_depth)
+        return {"type": "empty_head"}
+    
+    elif isinstance(expr, (BinaryAtomicFormula, UnaryAtomicFormula)):
+        # Atomic predicate - leaf node
+        result["type"] = "atomic"
+        if hasattr(expr, 'STATE_NAME'):
+            result["predicate"] = expr.STATE_NAME
+        if hasattr(expr, 'input1'):
+            result["arg1"] = expr.input1
+        if hasattr(expr, 'input2'):
+            result["arg2"] = expr.input2
+        elif hasattr(expr, 'input'):
+            result["arg1"] = expr.input
+        # Get value from parent's child_values if available
+        return result
+    
+    elif isinstance(expr, NQuantifier):
         # forn N: requires exactly N of the children to be true
-        # child_values already populated after evaluate()
-        pred_name = body_to_name(expr.body) if hasattr(expr, 'body') else f"forn_{id(expr)}"
-        count = sum(expr.child_values) if expr.child_values else 0
-        threshold = expr.N
-        results[f"forn_{pred_name}::count"] = int(count)
-        results[f"forn_{pred_name}::threshold"] = threshold
-        results[f"forn_{pred_name}::satisfied"] = (count >= threshold)
+        result["type"] = "forn"
+        result["n"] = expr.N
+        # forn has different body structure: [['N'], ['?type', '-', 'type'], ['predicate', ...]]
+        category = get_category_forn(expr.body)
+        if category:
+            result["category"] = category
+        pred_name, pred_args = get_predicate_info_forn(expr.body)
+        if pred_name:
+            result["predicate"] = pred_name
+            if pred_args:
+                result["args"] = pred_args
         
-        # Optionally extract individual child predicates
-        if expand_instances:
-            for i, (child, val) in enumerate(zip(expr.children, expr.child_values or [])):
-                if hasattr(child, 'input1'):
-                    # Atomic formula - get specific instance
-                    instance_name = child.input1 if hasattr(child, 'input1') else f"child_{i}"
-                    results[f"forn_{pred_name}::{instance_name}"] = bool(val)
-                
-    elif isinstance(expr, Universal) and 'forall' in quantifier_types:
+        count = sum(expr.child_values) if expr.child_values else 0
+        result["count"] = int(count)
+        result["threshold"] = expr.N
+        result["satisfied"] = (count >= expr.N)
+        
+        # Use shared child iteration helper
+        param_label = get_param_label_forn(expr.body)
+        result["instances"] = iterate_children_with_recursion(expr, param_label, skip_atomic=True)
+        
+        return result
+    
+    elif isinstance(expr, Universal):
         # forall: requires all children to be true
-        pred_name = body_to_name(expr.body) if hasattr(expr, 'body') else f"forall_{id(expr)}"
+        result["type"] = "forall"
+        category = get_category(expr.body)
+        if category:
+            result["category"] = category
+        pred_name, pred_args = get_predicate_info(expr.body)
+        if pred_name:
+            result["predicate"] = pred_name
+            if pred_args:
+                result["args"] = pred_args
+        
         count = sum(expr.child_values) if expr.child_values else 0
         threshold = len(expr.children)
-        results[f"forall_{pred_name}::count"] = int(count)
-        results[f"forall_{pred_name}::threshold"] = threshold  
-        results[f"forall_{pred_name}::satisfied"] = (count == threshold)
+        result["count"] = int(count)
+        result["threshold"] = threshold
+        result["satisfied"] = (count == threshold)
         
-        # Optionally extract individual child predicates  
-        if expand_instances:
-            for i, (child, val) in enumerate(zip(expr.children, expr.child_values or [])):
-                if hasattr(child, 'input1'):
-                    instance_name = child.input1
-                    results[f"forall_{pred_name}::{instance_name}"] = bool(val)
+        # Use shared child iteration helper
+        param_label = get_param_label(expr.body)
+        result["instances"] = iterate_children_with_recursion(expr, param_label, skip_atomic=True)
         
-    elif isinstance(expr, Existential) and 'exists' in quantifier_types:
+        return result
+    
+    elif isinstance(expr, Existential):
         # exists: requires at least 1 child to be true
-        pred_name = body_to_name(expr.body) if hasattr(expr, 'body') else f"exists_{id(expr)}"
-        count = sum(expr.child_values) if expr.child_values else 0
-        results[f"exists_{pred_name}::count"] = int(count)
-        results[f"exists_{pred_name}::threshold"] = 1
-        results[f"exists_{pred_name}::satisfied"] = (count >= 1)
+        result["type"] = "exists"
+        category = get_category(expr.body)
+        if category:
+            result["category"] = category
         
-    elif isinstance(expr, ForNPairs) and 'fornpairs' in quantifier_types:
-        # fornpairs N: N pairs must satisfy the predicate
-        pred_name = body_to_name(expr.body) if hasattr(expr, 'body') else f"fornpairs_{id(expr)}"
-        # child_values is a 2D array for pairs
+        count = sum(expr.child_values) if expr.child_values else 0
+        total = len(expr.children) if expr.children else 0
+        result["count"] = int(count)
+        result["total"] = total
+        result["threshold"] = 1
+        result["satisfied"] = (count >= 1)
+        
+        # Use shared child iteration helper (include atomic for exists since children might be simple predicates)
+        param_label = get_param_label(expr.body)
+        result["instances"] = iterate_children_with_recursion(expr, param_label, skip_atomic=False)
+        
+        return result
+    
+    elif isinstance(expr, ForPairs):
+        # forpairs: bijective matching
+        result["type"] = "forpairs"
+        if hasattr(expr, 'body') and isinstance(expr.body, (list, tuple)):
+            # Extract both categories
+            if len(expr.body) >= 2:
+                cat1 = get_category([expr.body[0]])
+                cat2 = get_category([expr.body[1]])
+                if cat1:
+                    result["category1"] = cat1
+                if cat2:
+                    result["category2"] = cat2
+            pred_name, pred_args = get_predicate_info(expr.body)
+            if pred_name:
+                result["predicate"] = pred_name
+        
         if hasattr(expr, 'child_values') and expr.child_values is not None:
             import numpy as np
-            # Count total satisfied pairs (True cells in the matrix)
             pair_count = int(np.sum(expr.child_values))
             total_pairs = expr.child_values.size
-            results[f"fornpairs_{pred_name}::count"] = pair_count
-            results[f"fornpairs_{pred_name}::total"] = total_pairs
-            results[f"fornpairs_{pred_name}::threshold"] = expr.N
-            # For satisfaction, need N rows and N cols to have at least one match each
+            L = min(expr.child_values.shape) if len(expr.child_values.shape) == 2 else 0
+            result["count"] = pair_count
+            result["total"] = total_pairs
+            result["threshold"] = L
             row_satisfied = int(np.sum(np.any(expr.child_values, axis=1)))
             col_satisfied = int(np.sum(np.any(expr.child_values, axis=0)))
-            results[f"fornpairs_{pred_name}::satisfied"] = (row_satisfied >= expr.N and col_satisfied >= expr.N)
-            
-    elif isinstance(expr, ForPairs) and 'forpairs' in quantifier_types:
-        # forpairs: all pairs must satisfy (bijective matching)
-        pred_name = body_to_name(expr.body) if hasattr(expr, 'body') else f"forpairs_{id(expr)}"
+            result["satisfied"] = (row_satisfied >= L and col_satisfied >= L)
+        
+        return result
+    
+    elif isinstance(expr, ForNPairs):
+        # fornpairs N: N pairs must satisfy
+        result["type"] = "fornpairs"
+        result["n"] = expr.N
+        if hasattr(expr, 'body') and isinstance(expr.body, (list, tuple)):
+            if len(expr.body) >= 2:
+                cat1 = get_category([expr.body[0]])
+                cat2 = get_category([expr.body[1]])
+                if cat1:
+                    result["category1"] = cat1
+                if cat2:
+                    result["category2"] = cat2
+            pred_name, pred_args = get_predicate_info(expr.body)
+            if pred_name:
+                result["predicate"] = pred_name
+        
         if hasattr(expr, 'child_values') and expr.child_values is not None:
             import numpy as np
-            # Count total satisfied pairs (True cells in the matrix)
             pair_count = int(np.sum(expr.child_values))
             total_pairs = expr.child_values.size
-            L = min(len(expr.children), len(expr.children[0])) if expr.children else 0
-            results[f"forpairs_{pred_name}::count"] = pair_count
-            results[f"forpairs_{pred_name}::total"] = total_pairs
-            results[f"forpairs_{pred_name}::threshold"] = L
-            # For satisfaction, need L rows and L cols to have at least one match each
+            result["count"] = pair_count
+            result["total"] = total_pairs
+            result["threshold"] = expr.N
             row_satisfied = int(np.sum(np.any(expr.child_values, axis=1)))
             col_satisfied = int(np.sum(np.any(expr.child_values, axis=0)))
-            results[f"forpairs_{pred_name}::satisfied"] = (row_satisfied >= L and col_satisfied >= L)
-            
-    elif isinstance(expr, Conjunction) and 'and' in quantifier_types:
-        # and: all must be true - recurse into children
-        for i, child in enumerate(expr.children):
-            child_results = extract_predicate_details(
-                child, f"{prefix}and_{i}_", expand_instances, max_depth, 
-                quantifier_types, _current_depth + 1
-            )
-            results.update(child_results)
-            
-    elif isinstance(expr, Disjunction) and 'or' in quantifier_types:
-        # or: at least one must be true - recurse into children
-        for i, child in enumerate(expr.children):
-            child_results = extract_predicate_details(
-                child, f"{prefix}or_{i}_", expand_instances, max_depth,
-                quantifier_types, _current_depth + 1
-            )
-            results.update(child_results)
-            
-    elif isinstance(expr, Negation) and 'not' in quantifier_types:
+            result["satisfied"] = (row_satisfied >= expr.N and col_satisfied >= expr.N)
+        
+        return result
+    
+    elif isinstance(expr, Conjunction):
+        # and: all must be true
+        result["type"] = "and"
+        result["satisfied"] = all(expr.child_values) if expr.child_values else False
+        result["children"] = []
+        for child in expr.children:
+            child_tree = extract_predicate_tree(child, _current_depth + 1, max_depth)
+            if child_tree:
+                result["children"].append(child_tree)
+        return result
+    
+    elif isinstance(expr, Disjunction):
+        # or: at least one must be true
+        result["type"] = "or"
+        result["satisfied"] = any(expr.child_values) if expr.child_values else False
+        result["children"] = []
+        for child in expr.children:
+            child_tree = extract_predicate_tree(child, _current_depth + 1, max_depth)
+            if child_tree:
+                result["children"].append(child_tree)
+        return result
+    
+    elif isinstance(expr, Negation):
         # not: negation of child
+        result["type"] = "not"
         child = expr.children[0] if expr.children else None
         if child is not None:
-            child_results = extract_predicate_details(
-                child, f"{prefix}not_", expand_instances, max_depth,
-                quantifier_types, _current_depth + 1
-            )
-            # Invert the values for negated predicates
-            for k, v in child_results.items():
-                if isinstance(v, bool):
-                    results[f"not_{k}"] = not v
-                else:
-                    results[f"not_{k}"] = v
-                    
-    else:
-        # Atomic formula (BinaryAtomicFormula, UnaryAtomicFormula)
-        # These are handled by the parent predicate_to_str, so we don't need to duplicate
-        pass
-            
-    return results
-
-
-def get_detailed_predicate_states(env):
-    """
-    Get detailed predicate evaluation states directly from the BDDL expression tree.
+            result["child"] = extract_predicate_tree(child, _current_depth + 1, max_depth)
+            # Satisfaction is inverted
+            child_sat = result["child"].get("satisfied", False) if result["child"] else False
+            result["satisfied"] = not child_sat
+        return result
     
-    This extracts count/threshold information for quantified predicates (forn, forall, exists)
-    which is computed during online evaluation.
+    return result
+
+
+def get_predicate_states_hierarchical(env):
+    """
+    Get predicate states as a list of hierarchical tree structures.
     
     Returns:
-        dict: Mapping from predicate keys to values including:
-            - Simple predicates: boolean
-            - Count predicates: ::count, ::threshold, ::satisfied
+        list: List of predicate tree dicts, one per goal condition
     """
-    detailed_states = {}
-    
-    # Iterate through all grounded goal state options
-    for option_idx, option in enumerate(env.task.ground_goal_state_options):
-        for pred_idx, pred in enumerate(option):
-            # First evaluate to populate child_values throughout the tree
-            pred.evaluate()
-            
-            # Then extract detailed information
-            details = extract_predicate_details(pred)
-            for key, value in details.items():
-                full_key = f"{option_idx}:::{key}"
-                detailed_states[full_key] = value
-    
-    return detailed_states
-
-
-def get_predicate_states(env, detailed=True, expand_instances=False, max_depth=2, 
-                          quantifier_types=None):
-    """
-    Get current state of all goal predicates from the ORIGINAL goal conditions
-    (with forall/forn/exists quantifiers intact).
-    
-    Args:
-        env: The environment with task and activity_goal_conditions
-        detailed: If True, include count/threshold for quantified predicates
-        expand_instances: If True, include per-instance boolean values
-        max_depth: Maximum recursion depth (-1 for unlimited)
-        quantifier_types: Set of quantifier types to expand (default: forn, forall, exists, fornpairs, forpairs)
-    
-    Returns:
-        dict: Mapping from predicate string to boolean value (and counts if detailed=True)
-    """
-    predicate_states = {}
-    
-    # Use activity_goal_conditions which has the original structure with quantifiers
-    # NOT ground_goal_state_options which is already expanded
     goal_conditions = env.task.activity_goal_conditions
+    predicates = []
     
     for pred in goal_conditions:
         # Evaluate to populate child_values throughout the tree
         value = pred.evaluate()
-        pred_str = predicate_to_str(pred)
-        predicate_states[pred_str] = bool(value)
         
-        # Extract count/threshold info from quantifiers (forall, forn, exists, etc.)
-        if detailed:
-            details = extract_predicate_details(
-                pred, 
-                expand_instances=expand_instances,
-                max_depth=max_depth,
-                quantifier_types=quantifier_types
-            )
-            for detail_key, detail_value in details.items():
-                predicate_states[detail_key] = detail_value
+        # Extract as tree structure
+        tree = extract_predicate_tree(pred)
+        tree["_raw_description"] = predicate_to_str(pred)
+        tree["_satisfied"] = bool(value)
+        
+        predicates.append(tree)
     
-    return predicate_states
+    return predicates
 
 
 def get_goal_progress(env):
@@ -359,18 +519,13 @@ def get_goal_progress(env):
         return {"error": str(e)}
 
 
-def replay_and_extract_predicates(hdf_input_path, output_dir=None, detailed=True,
-                                   expand_instances=False, max_depth=2, quantifier_types=None):
+def replay_and_extract_predicates(hdf_input_path, output_dir=None):
     """
     Replay a single HDF5 file and extract predicate states at each timestep.
     
     Args:
         hdf_input_path: Path to the HDF5 file to replay
         output_dir: Output directory (default: same as input file)
-        detailed: If True, include count/threshold info for quantified predicates (forn, forall, etc.)
-        expand_instances: If True, include per-instance boolean values (can generate many columns)
-        max_depth: Maximum recursion depth for nested expressions (default: 2, -1 for unlimited)
-        quantifier_types: Set of quantifier types to expand (default: forn, forall, exists, fornpairs, forpairs)
     
     Returns:
         Path to output parquet file
@@ -454,44 +609,18 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None, detailed=True
         
         env.reset()
         
-        # Load initial state
-        og.sim.load_state(state[0, :int(state_size[0])], serialized=True)
-        og.sim.step()
-        
-        # Record initial predicate state
-        pred_states = get_predicate_states(
-            env, detailed=detailed, expand_instances=expand_instances,
-            max_depth=max_depth, quantifier_types=quantifier_types
-        )
-        progress = get_goal_progress(env)
-        
-        record = {
-            "episode_id": episode_id,
-            "step": 0,
-            "task_name": task_name,
-            "progress": progress.get("progress", 0.0),
-            "done": progress.get("done", False),
-            "satisfied_count": progress.get("satisfied_count", 0),
-            "total_count": progress.get("total_count", 0),
-        }
-        record.update(pred_states)
-        all_records.append(record)
-        
-        # Process each step (sample every 90 frames = 3 seconds at 30Hz)
+        # Build list of steps to sample: first, every 90 frames, and last
         sample_interval = 90
-        for step_idx in range(sample_interval, n_steps, sample_interval):
-            # Load state
+        step_indices = [0] + list(range(sample_interval, n_steps, sample_interval))
+        if step_indices[-1] != n_steps - 1:
+            step_indices.append(n_steps - 1)
+        
+        for step_idx in step_indices:
             og.sim.load_state(state[step_idx, :int(state_size[step_idx])], serialized=True)
             og.sim.step()
             
-            # Get predicate states
-            pred_states = get_predicate_states(
-                env, detailed=detailed, expand_instances=expand_instances,
-                max_depth=max_depth, quantifier_types=quantifier_types
-            )
             progress = get_goal_progress(env)
-            
-            record = {
+            all_records.append({
                 "episode_id": episode_id,
                 "step": step_idx,
                 "task_name": task_name,
@@ -499,12 +628,10 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None, detailed=True
                 "done": progress.get("done", False),
                 "satisfied_count": progress.get("satisfied_count", 0),
                 "total_count": progress.get("total_count", 0),
-            }
-            record.update(pred_states)
-            all_records.append(record)
+                "predicates": get_predicate_states_hierarchical(env),
+            })
         
-        n_samples = 1 + len(range(sample_interval, n_steps, sample_interval))
-        print(f"    Processed {n_steps} steps ({n_samples} samples)")
+        print(f"    Processed {n_steps} steps ({len(step_indices)} samples)")
     
     # Convert to DataFrame and save
     df = pd.DataFrame(all_records)
@@ -536,20 +663,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic extraction with count/threshold info (default)
+  # Process single file
   python replay_extract_predicates.py --file demo.hdf5
   
-  # Minimal output - only boolean values
-  python replay_extract_predicates.py --file demo.hdf5 --no-detailed
+  # Process directory
+  python replay_extract_predicates.py --dir /path/to/demos
   
-  # Include per-instance values (more columns)
-  python replay_extract_predicates.py --file demo.hdf5 --expand-instances
-  
-  # Only expand forn predicates, not forall/exists
-  python replay_extract_predicates.py --file demo.hdf5 --quantifiers forn
-  
-  # Limit recursion depth for nested expressions
-  python replay_extract_predicates.py --file demo.hdf5 --max-depth 1
+  # Filter by pattern
+  python replay_extract_predicates.py --dir /path/to/demos --pattern task_name
 """
     )
     parser.add_argument("--file", type=str, help="Single HDF5 file to process")
@@ -558,20 +679,6 @@ Examples:
                         help="Output directory (default: same as input)")
     parser.add_argument("--pattern", type=str, default=None,
                         help="Only process files matching pattern")
-    
-    # Predicate expansion controls
-    parser.add_argument("--detailed", action="store_true", default=True,
-                        help="Include count/threshold for quantified predicates (default: True)")
-    parser.add_argument("--no-detailed", action="store_false", dest="detailed",
-                        help="Only include simple boolean predicate values")
-    parser.add_argument("--expand-instances", action="store_true", default=False,
-                        help="Include per-instance boolean values (can generate many columns)")
-    parser.add_argument("--max-depth", type=int, default=2,
-                        help="Max recursion depth for nested expressions (default: 2, -1 for unlimited)")
-    parser.add_argument("--quantifiers", type=str, nargs="+", 
-                        default=["forn", "forall", "exists", "fornpairs", "forpairs"],
-                        help="Quantifier types to expand (default: forn forall exists fornpairs forpairs). "
-                             "Options: forn, forall, exists, fornpairs, forpairs, and, or, not")
     
     args = parser.parse_args()
     
@@ -588,20 +695,10 @@ Examples:
         print("\nError: Either --file or --dir must be specified")
         return
     
-    # Convert quantifiers to set
-    quantifier_types = set(args.quantifiers)
-    
     # Process each file
     for hdf_file in hdf_files:
         try:
-            replay_and_extract_predicates(
-                hdf_file, 
-                args.output_dir, 
-                detailed=args.detailed,
-                expand_instances=args.expand_instances,
-                max_depth=args.max_depth,
-                quantifier_types=quantifier_types
-            )
+            replay_and_extract_predicates(hdf_file, args.output_dir)
         except Exception as e:
             print(f"Error processing {hdf_file}: {e}")
             import traceback
