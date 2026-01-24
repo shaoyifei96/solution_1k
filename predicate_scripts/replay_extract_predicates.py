@@ -617,6 +617,8 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None):
         
         for step_idx in step_indices:
             og.sim.load_state(state[step_idx, :int(state_size[step_idx])], serialized=True)
+            # Step a few times to let physics settle and contacts update
+            # for _ in range(1):
             og.sim.step()
             
             progress = get_goal_progress(env)

@@ -16,13 +16,14 @@ import re
 import argparse
 
 
-def format_predicate_tree(pred, indent=0):
+def format_predicate_tree(pred, indent=0, parent_satisfied=None):
     """
     Format a predicate tree node into human-readable lines.
     
     Args:
         pred: Dict with predicate tree structure from extract_predicate_tree()
         indent: Current indentation level
+        parent_satisfied: If set, use this for children that don't have their own satisfied field
         
     Returns:
         list of formatted lines
@@ -31,8 +32,22 @@ def format_predicate_tree(pred, indent=0):
     prefix = "    " * indent
     
     pred_type = pred.get("type", "unknown")
-    satisfied = pred.get("satisfied", pred.get("_satisfied", False))
-    status = "✓" if satisfied else "✗"
+    # Use explicit satisfied if present, otherwise fall back to parent's status
+    has_explicit_status = "satisfied" in pred or "_satisfied" in pred
+    if "satisfied" in pred:
+        satisfied = pred["satisfied"]
+    elif "_satisfied" in pred:
+        satisfied = pred["_satisfied"]
+    elif parent_satisfied is not None:
+        satisfied = parent_satisfied
+    else:
+        satisfied = False
+    
+    # Use ○ (circle) for uncertain status, ✓ for satisfied, ✗ for not satisfied
+    if not has_explicit_status and parent_satisfied is None:
+        status = "○"  # uncertain
+    else:
+        status = "✓" if satisfied else "✗"
     
     if pred_type == "atomic":
         # Leaf node - atomic predicate
@@ -155,6 +170,69 @@ def format_predicate_tree(pred, indent=0):
         
         # Determine inner structure from first instance's nested field
         instances = pred.get("instances", {})
+        
+        # Find the first satisfied instance, or first instance if none satisfied
+        best_instance = None
+        best_inst_name = None
+        for inst_name, inst_data in sorted(instances.items()):
+            if isinstance(inst_data, dict):
+                if best_instance is None:
+                    best_instance = inst_data
+                    best_inst_name = inst_name
+                if inst_data.get("satisfied", False):
+                    best_instance = inst_data
+                    best_inst_name = inst_name
+                    break
+        
+        # Check if nested contains another quantifier - if so, promote it
+        if best_instance and "nested" in best_instance:
+            nested = best_instance["nested"]
+            nested_type = nested.get("type", "")
+            
+            # If nested is a quantifier (forall, forn, exists), promote it
+            if nested_type in ["forall", "forn"]:
+                nested_cat = nested.get("category", "?")
+                nested_pred = nested.get("predicate", "")
+                nested_args = nested.get("args", [])
+                nested_n = nested.get("n", "")
+                nested_count = nested.get("count", "?")
+                nested_threshold = nested.get("threshold", "?")
+                nested_satisfied = nested.get("satisfied", False)
+                
+                # Use the nested quantifier's satisfaction status
+                nested_status = "✓" if nested_satisfied else "✗"
+                
+                if nested_type == "forall":
+                    if nested_pred and nested_args:
+                        display = f"forall({nested_cat}) -> {nested_pred}({', '.join(nested_args)})"
+                    else:
+                        display = f"forall({nested_cat})"
+                else:  # forn
+                    if nested_pred and nested_args:
+                        display = f"forn({nested_n})({nested_cat}) -> {nested_pred}({', '.join(nested_args)})"
+                    else:
+                        display = f"forn({nested_n})({nested_cat})"
+                
+                lines.append(f"{prefix}{nested_status} {display}")
+                lines.append(f"{prefix}    via: exists({category}) bound to {best_inst_name}")
+                lines.append(f"{prefix}    count: {nested_count}/{nested_threshold}")
+                lines.append(f"{prefix}    satisfied: {nested_satisfied}")
+                
+                # Show inner instances if available
+                nested_instances = nested.get("instances", {})
+                if nested_instances:
+                    lines.append(f"{prefix}    instances:")
+                    for n_inst_name, n_inst_val in sorted(nested_instances.items()):
+                        if isinstance(n_inst_val, bool):
+                            n_status = "✓" if n_inst_val else "✗"
+                            lines.append(f"{prefix}        {n_status} {n_inst_name}")
+                        elif isinstance(n_inst_val, dict):
+                            n_status = "✓" if n_inst_val.get("satisfied", False) else "✗"
+                            lines.append(f"{prefix}        {n_status} {n_inst_name}")
+                
+                return lines
+        
+        # Fall back to original exists display for simple exists or non-quantifier nested
         inner_display = ""
         for inst_name, inst_data in instances.items():
             if isinstance(inst_data, dict) and "nested" in inst_data:
@@ -239,27 +317,33 @@ def format_predicate_tree(pred, indent=0):
         lines.append(f"{prefix}    satisfied: {satisfied}")
         
     elif pred_type == "and":
-        # Conjunction
+        # Conjunction - if and is satisfied, all children must be satisfied
         lines.append(f"{prefix}{status} and")
         children = pred.get("children", [])
         for child in children:
-            child_lines = format_predicate_tree(child, indent + 1)
+            # Pass parent satisfied status for children without their own
+            child_lines = format_predicate_tree(child, indent + 1, parent_satisfied=satisfied)
             lines.extend(child_lines)
             
     elif pred_type == "or":
-        # Disjunction
+        # Disjunction - can't infer individual child status from parent
+        # If or is satisfied, at least one child must be true, but we don't know which
         lines.append(f"{prefix}{status} or")
+        if satisfied:
+            lines.append(f"{prefix}    (at least one of the following is satisfied)")
         children = pred.get("children", [])
         for child in children:
-            child_lines = format_predicate_tree(child, indent + 1)
+            # For or: show children with '?' if parent is satisfied but children lack status
+            child_lines = format_predicate_tree(child, indent + 1, parent_satisfied=None)
             lines.extend(child_lines)
             
     elif pred_type == "not":
-        # Negation
+        # Negation - child status is opposite of not's status
         lines.append(f"{prefix}{status} not")
         child = pred.get("child")
         if child:
-            child_lines = format_predicate_tree(child, indent + 1)
+            # For not: if not is satisfied, child is NOT satisfied (and vice versa)
+            child_lines = format_predicate_tree(child, indent + 1, parent_satisfied=(not satisfied))
             lines.extend(child_lines)
     
     else:
@@ -302,15 +386,19 @@ def format_nested_quantifier(nested, indent=0):
         lines.append(f"{prefix}    count: {count}/{threshold}, satisfied: {nested.get('satisfied', False)}")
         
     elif nested_type == "and":
+        nested_satisfied = nested.get("satisfied", False)
         lines.append(f"{prefix}{nested_status} nested: and")
         for child in nested.get("children", []):
-            child_lines = format_predicate_tree(child, indent + 1)
+            child_lines = format_predicate_tree(child, indent + 1, parent_satisfied=nested_satisfied)
             lines.extend(child_lines)
             
     elif nested_type == "or":
+        nested_satisfied = nested.get("satisfied", False)
         lines.append(f"{prefix}{nested_status} nested: or")
+        if nested_satisfied:
+            lines.append(f"{prefix}    (at least one of the following is satisfied)")
         for child in nested.get("children", []):
-            child_lines = format_predicate_tree(child, indent + 1)
+            child_lines = format_predicate_tree(child, indent + 1, parent_satisfied=None)
             lines.extend(child_lines)
     
     return lines
