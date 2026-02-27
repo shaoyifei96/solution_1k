@@ -11,3 +11,9 @@ assets/
 .DS_Store
 *_old.py
 *_backup.py
+logs/
+viz_outputs/
+*.egg-info/
+BEHAVIOR-1K/
+openpi/
+.github/
