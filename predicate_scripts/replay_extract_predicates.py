@@ -287,11 +287,17 @@ def extract_predicate_tree(expr, _current_depth=0, max_depth=10):
         # HEAD wraps a single child expression
         child = expr.children[0] if expr.children else None
         if child is not None:
-            return extract_predicate_tree(child, _current_depth, max_depth)
+            child_tree = extract_predicate_tree(child, _current_depth, max_depth)
+            # Attach satisfaction from HEAD's child_values (populated by evaluate())
+            if expr.child_values is not None and len(expr.child_values) > 0:
+                child_tree["satisfied"] = bool(expr.child_values[0])
+            return child_tree
         return {"type": "empty_head"}
     
     elif isinstance(expr, (BinaryAtomicFormula, UnaryAtomicFormula)):
         # Atomic predicate - leaf node
+        # Note: 'satisfied' is set by the PARENT from its child_values after recursion
+        # (HEAD, Negation, Conjunction, Disjunction all attach satisfaction to children)
         result["type"] = "atomic"
         if hasattr(expr, 'STATE_NAME'):
             result["predicate"] = expr.STATE_NAME
@@ -301,7 +307,6 @@ def extract_predicate_tree(expr, _current_depth=0, max_depth=10):
             result["arg2"] = expr.input2
         elif hasattr(expr, 'input'):
             result["arg1"] = expr.input
-        # Get value from parent's child_values if available
         return result
     
     elif isinstance(expr, NQuantifier):
@@ -437,9 +442,12 @@ def extract_predicate_tree(expr, _current_depth=0, max_depth=10):
         result["type"] = "and"
         result["satisfied"] = all(expr.child_values) if expr.child_values else False
         result["children"] = []
-        for child in expr.children:
+        for i, child in enumerate(expr.children):
             child_tree = extract_predicate_tree(child, _current_depth + 1, max_depth)
             if child_tree:
+                # Attach satisfaction status from parent's child_values
+                if expr.child_values is not None and i < len(expr.child_values):
+                    child_tree["satisfied"] = bool(expr.child_values[i])
                 result["children"].append(child_tree)
         return result
     
@@ -448,10 +456,14 @@ def extract_predicate_tree(expr, _current_depth=0, max_depth=10):
         result["type"] = "or"
         result["satisfied"] = any(expr.child_values) if expr.child_values else False
         result["children"] = []
-        for child in expr.children:
+        for i, child in enumerate(expr.children):
             child_tree = extract_predicate_tree(child, _current_depth + 1, max_depth)
             if child_tree:
+                # Attach satisfaction status from parent's child_values
+                if expr.child_values is not None and i < len(expr.child_values):
+                    child_tree["satisfied"] = bool(expr.child_values[i])
                 result["children"].append(child_tree)
+        return result
         return result
     
     elif isinstance(expr, Negation):
@@ -460,9 +472,16 @@ def extract_predicate_tree(expr, _current_depth=0, max_depth=10):
         child = expr.children[0] if expr.children else None
         if child is not None:
             result["child"] = extract_predicate_tree(child, _current_depth + 1, max_depth)
-            # Satisfaction is inverted
-            child_sat = result["child"].get("satisfied", False) if result["child"] else False
-            result["satisfied"] = not child_sat
+            # Get child satisfaction from expr.child_values (populated by evaluate())
+            # This is more reliable than trying to get it from the recursively-built child dict
+            if expr.child_values is not None and len(expr.child_values) > 0:
+                child_sat = bool(expr.child_values[0])
+                result["child"]["satisfied"] = child_sat  # Also store in child for consistency
+                result["satisfied"] = not child_sat
+            else:
+                # Fallback: try to get from child dict (may be unreliable for atomic)
+                child_sat = result["child"].get("satisfied", False) if result["child"] else False
+                result["satisfied"] = not child_sat
         return result
     
     return result
@@ -480,12 +499,11 @@ def get_predicate_states_hierarchical(env):
     
     for pred in goal_conditions:
         # Evaluate to populate child_values throughout the tree
-        value = pred.evaluate()
+        pred.evaluate()
         
-        # Extract as tree structure
+        # Extract as tree structure (satisfaction is attached by parent wrappers)
         tree = extract_predicate_tree(pred)
         tree["_raw_description"] = predicate_to_str(pred)
-        tree["_satisfied"] = bool(value)
         
         predicates.append(tree)
     
@@ -519,13 +537,15 @@ def get_goal_progress(env):
         return {"error": str(e)}
 
 
-def replay_and_extract_predicates(hdf_input_path, output_dir=None):
+def replay_and_extract_predicates(hdf_input_path, output_dir=None, sim_steps=1, sample_interval=1):
     """
     Replay a single HDF5 file and extract predicate states at each timestep.
     
     Args:
         hdf_input_path: Path to the HDF5 file to replay
         output_dir: Output directory (default: same as input file)
+        sim_steps: Number of simulation steps after loading state (default: 1)
+        sample_interval: Sample every N frames (default: 1 = every frame)
     
     Returns:
         Path to output parquet file
@@ -542,6 +562,19 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None):
     base_name = hdf_input_path.stem
     parquet_path = output_dir / f"{base_name}_predicates.parquet"
     jsonl_path = output_dir / f"{base_name}_predicates.jsonl"
+    
+    # Check if already completed (done=True in last record)
+    if jsonl_path.exists():
+        try:
+            with open(jsonl_path, 'r') as f:
+                lines = f.readlines()
+            if lines:
+                last_record = json.loads(lines[-1])
+                if last_record.get("done", False):
+                    print(f"Skipping (already complete): {hdf_input_path}", flush=True)
+                    return str(parquet_path)
+        except Exception:
+            pass  # If we can't read it, re-process
     
     print(f"Processing: {hdf_input_path}", flush=True)
     print(f"Output: {parquet_path}", flush=True)
@@ -609,17 +642,17 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None):
         
         env.reset()
         
-        # Build list of steps to sample: first, every 90 frames, and last
-        sample_interval = 90
+        # Build list of steps to sample: first, every N frames, and last
         step_indices = [0] + list(range(sample_interval, n_steps, sample_interval))
         if step_indices[-1] != n_steps - 1:
             step_indices.append(n_steps - 1)
         
         for step_idx in step_indices:
             og.sim.load_state(state[step_idx, :int(state_size[step_idx])], serialized=True)
-            # Step a few times to let physics settle and contacts update
-            # for _ in range(1):
-            og.sim.step()
+            # Step to let physics settle and contacts update
+            # Contact detection requires physics simulation to register contacts
+            for _ in range(sim_steps):
+                og.sim.step()
             
             progress = get_goal_progress(env)
             all_records.append({
@@ -681,6 +714,10 @@ Examples:
                         help="Output directory (default: same as input)")
     parser.add_argument("--pattern", type=str, default=None,
                         help="Only process files matching pattern")
+    parser.add_argument("--sim-steps", type=int, default=1,
+                        help="Number of simulation steps after loading state (default: 1, use 0 for no stepping)")
+    parser.add_argument("--sample-interval", type=int, default=1,
+                        help="Sample every N frames (default: 1 = every frame)")
     
     args = parser.parse_args()
     
@@ -700,7 +737,7 @@ Examples:
     # Process each file
     for hdf_file in hdf_files:
         try:
-            replay_and_extract_predicates(hdf_file, args.output_dir)
+            replay_and_extract_predicates(hdf_file, args.output_dir, sim_steps=args.sim_steps, sample_interval=args.sample_interval)
         except Exception as e:
             print(f"Error processing {hdf_file}: {e}")
             import traceback
