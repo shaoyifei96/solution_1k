@@ -30,6 +30,13 @@ We use policy based on Pi0.5 and built on top of [openpi](https://github.com/Phy
 - Predicts current task stage (5-15 stages per task solely based on the timestamps) as auxiliary output from VLM (using only images and task embeddings)
 - Stage tracking with voting logic for smooth transitions and non-Markovian resolution, passed as input to the model (using mix of sin encoded subtask state and learnable embeddings)
 
+**Predicate-Conditioned VLA:**
+- Auxiliary predicate prediction head: predicts per-object goal completion (e.g., "is cup on table?") as binary labels (BCE loss, 0.1 weight)
+- 233 task-specific predicate embeddings across 50 tasks (1-20 predicates per task, max 20)
+- Gated fusion of done/remaining predicate embeddings with task embeddings (4 fused representations)
+- Two predicate extraction approaches: (1) label-based from skill annotations + BDDL goal definitions, (2) simulator-based by replaying demos and evaluating BDDL conditions
+- Inference uses consensus voting over a sliding window of predicate predictions for smooth transitions
+
 **Inference Optimizations:**
 - Soft inpainting: predict 30 actions, execute 26, keep 4 for next prediction for inpainting. Inpainting is soft (only first 70% of the denoising steps are inpainted) and correlation aware (the rest of the actions are guided towards the linear regression prediction for them from the original 4 actions).
 - 1.3x speedup via cubic interpolation (26 predicted actions are executed in 20 steps). Speed up is disabled when gripper state is changing
@@ -178,6 +185,48 @@ python BEHAVIOR-1K/omnigibson/learning/eval.py \
 ```
 
 **Note**: this repo supports only our modification of the model developed for the competition, if you want to use Pi0.5 or Pi0 policies, use original [openpi](https://github.com/Physical-Intelligence/openpi) repository.
+
+---
+
+## 🔍 Predicate Extraction Pipeline
+
+We extract ground-truth predicate states (e.g., "is object at goal location?") from demonstrations to use as an auxiliary training signal. Two extraction approaches exist:
+
+### Version 1: Label-based (from annotations + BDDL definitions)
+
+Derives predicate states from skill annotations (pick/place labels) in the HDF5 metadata combined with BDDL goal definitions, **without** running the simulator. Faster but less accurate.
+
+Key scripts (in the workspace `data/predicate_data/` directory):
+- `generate_all_action_pairs_from_annotations.py` — Extracts action pairs from B1K skill annotations
+- `generate_state_action_vectors.py` — Builds per-timestep state/action vectors from annotation-derived action pairs
+- `generate_visual_predicates_v3.py` — Parses BDDL goal files and converts predicates to visually-grounded forms (counts instead of instance-specific)
+- `compare_predicate_methods.py` — Compares label-based vs simulator-based results
+
+### Version 2: Simulator-based (replay + BDDL evaluation)
+
+Replays demos in OmniGibson and calls `evaluate_goal_conditions()` at each timestep for ground-truth predicate states. More accurate but requires GPU + simulator.
+
+Key scripts (in `predicate_scripts/`):
+- `replay_extract_predicates.py` — Replays HDF5 demos, evaluates BDDL conditions → JSONL + Parquet
+- `generate_predicate_vectors.py` — Consolidates JSONL → `.pkl` state vectors for training
+- `visibility_utils.py` — Object visibility filtering for camera-aware predicates
+
+```bash
+# Extract predicates via simulator replay (SLURM array job, 1 GPU per task)
+sbatch jobs/extract_predicates.sh
+
+# Consolidate into training vectors
+sbatch jobs/generate_predicate_vectors.sh
+```
+
+### Training Integration
+
+Both versions produce `.pkl` files consumed by the same training pipeline:
+- `src/b1k/shared/predicate_data.py` — `PredicateDataStore` loads `.pkl` files
+- `src/b1k/transforms.py` — `ComputePredicateStateFromData` transform
+- `src/b1k/models/pi_behavior.py` — Predicate fusion + prediction head
+
+Set `predicate_data_path` in the training config to enable predicate conditioning. See `docs/PREDICATE_MIGRATION_SUMMARY.md` for full architecture details.
 
 ---
 

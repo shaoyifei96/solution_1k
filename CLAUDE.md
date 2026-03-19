@@ -102,6 +102,41 @@ All configs are **frozen dataclasses** in `src/b1k/training/config.py`. Named co
 
 Package manager: **uv** (Python >=3.11, <3.12). Pre-commit hooks: ruff (lint/format) + uv-lock. Three editable submodule packages: `openpi`, `bddl` (from BEHAVIOR-1K/bddl3), `omnigibson` (from BEHAVIOR-1K/OmniGibson).
 
+## Predicate Extraction Pipeline
+
+Two approaches for extracting predicate states (e.g., "is cup on table?", "is drawer open?") used as auxiliary training signal.
+
+### Version 1: Label-based (from annotations/BDDL definitions)
+Derives predicate states from skill annotations (pick/place labels) + BDDL goal definitions, **without** running the simulator.
+
+Scripts in `/vast/projects/kumar/lab/yishao/data/predicate_data/`:
+- `generate_all_action_pairs_from_annotations.py` — Extracts action pairs from B1K skill annotations (pick, place, open, close, etc.) in HDF5 metadata
+- `generate_state_action_vectors.py` — Builds per-timestep state/action vectors from annotation-derived action pairs
+- `generate_visual_predicates_v3.py` (and v2, `transform_to_visual_predicates.py`) — Parses BDDL goal files to define predicates, converts to visually-grounded forms (counts instead of instance-specific)
+- `process_task_samples.py` — Applies visual predicate transformation to sample files
+- `compare_bddl_to_visual.py`, `compare_predicate_methods.py`, `compare_predicate_methods_detailed.py`, `generate_comparison_summary.py` — Compare the two approaches
+- `bddl_comparison/` — Per-task comparison JSONs (task-0000 to task-0049) + summary CSV
+
+### Version 2: Simulator-based (replay + BDDL evaluation)
+Replays demos in OmniGibson and calls `evaluate_goal_conditions()` for ground-truth predicate states.
+
+Scripts in `predicate_scripts/` (this repo):
+- `replay_extract_predicates.py` — Core extractor: replays HDF5 in simulator, evaluates BDDL conditions per timestep → JSONL + Parquet
+- `generate_predicate_vectors.py` — Consolidates JSONL → .pkl state vectors for training
+- `visibility_utils.py` — Object visibility filtering
+- `format_predicate_hierarchy.py`, `consolidate_first_last.py`, `delete_failed_predicates.py` — Utilities
+
+SLURM jobs in `/vast/projects/kumar/lab/yishao/jobs/`:
+- `extract_predicates*.sh` — Submit simulator replay extraction
+- `generate_predicate_vectors.sh` — Post-process into training vectors
+
+### Training integration (uses whichever version's .pkl output)
+- `src/b1k/shared/predicate_data.py` — `PredicateDataStore` loads .pkl files
+- `src/b1k/transforms.py` — `ComputePredicateStateFromData`
+- `src/b1k/models/pi_behavior.py` — Predicate fusion + prediction head
+- `src/b1k/models/pi_behavior_config.py` — Predicate dimensions/offsets (50 tasks, max 20 predicates each, 233 total)
+- `src/b1k/shared/eval_b1k_wrapper.py` — Inference with consensus voting
+
 ## Known Issues
 
 - **Fork bomb on data loading**: `torch.compile` is monkey-patched to no-op in `data_loader.py` — do not remove this
