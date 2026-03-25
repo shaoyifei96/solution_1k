@@ -537,15 +537,16 @@ def get_goal_progress(env):
         return {"error": str(e)}
 
 
-def replay_and_extract_predicates(hdf_input_path, output_dir=None, sim_steps=1, sample_interval=1):
+def replay_and_extract_predicates(hdf_input_path, output_dir=None, sim_steps=5, sample_interval=1, force=False):
     """
     Replay a single HDF5 file and extract predicate states at each timestep.
-    
+
     Args:
         hdf_input_path: Path to the HDF5 file to replay
         output_dir: Output directory (default: same as input file)
-        sim_steps: Number of simulation steps after loading state (default: 1)
+        sim_steps: Number of simulation steps after loading state (default: 5)
         sample_interval: Sample every N frames (default: 1 = every frame)
+        force: Force re-processing even if output already exists
     
     Returns:
         Path to output parquet file
@@ -564,7 +565,7 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None, sim_steps=1, 
     jsonl_path = output_dir / f"{base_name}_predicates.jsonl"
     
     # Check if already completed (done=True in last record)
-    if jsonl_path.exists():
+    if not force and jsonl_path.exists():
         try:
             with open(jsonl_path, 'r') as f:
                 lines = f.readlines()
@@ -653,17 +654,29 @@ def replay_and_extract_predicates(hdf_input_path, output_dir=None, sim_steps=1, 
             # Contact detection requires physics simulation to register contacts
             for _ in range(sim_steps):
                 og.sim.step()
-            
-            progress = get_goal_progress(env)
+
+            # Extract predicates (single evaluate pass to avoid inconsistency)
+            predicates = get_predicate_states_hierarchical(env)
+
+            # Derive progress from the predicate tree directly
+            # (avoids double-evaluate bug where a second evaluate_goal_conditions()
+            #  call gives different results due to physics side effects)
+            total_count = len(predicates)
+            satisfied_count = sum(
+                1 for p in predicates if p.get("satisfied", p.get("_satisfied", False))
+            )
+            progress_val = satisfied_count / total_count if total_count > 0 else 0.0
+            done = (satisfied_count == total_count) and total_count > 0
+
             all_records.append({
                 "episode_id": episode_id,
                 "step": step_idx,
                 "task_name": task_name,
-                "progress": progress.get("progress", 0.0),
-                "done": progress.get("done", False),
-                "satisfied_count": progress.get("satisfied_count", 0),
-                "total_count": progress.get("total_count", 0),
-                "predicates": get_predicate_states_hierarchical(env),
+                "progress": progress_val,
+                "done": done,
+                "satisfied_count": satisfied_count,
+                "total_count": total_count,
+                "predicates": predicates,
             })
         
         print(f"    Processed {n_steps} steps ({len(step_indices)} samples)")
@@ -714,11 +727,13 @@ Examples:
                         help="Output directory (default: same as input)")
     parser.add_argument("--pattern", type=str, default=None,
                         help="Only process files matching pattern")
-    parser.add_argument("--sim-steps", type=int, default=1,
-                        help="Number of simulation steps after loading state (default: 1, use 0 for no stepping)")
+    parser.add_argument("--sim-steps", type=int, default=5,
+                        help="Number of simulation steps after loading state (default: 5, use 0 for no stepping)")
     parser.add_argument("--sample-interval", type=int, default=1,
                         help="Sample every N frames (default: 1 = every frame)")
-    
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-processing even if output already exists")
+
     args = parser.parse_args()
     
     if args.file:
@@ -737,7 +752,7 @@ Examples:
     # Process each file
     for hdf_file in hdf_files:
         try:
-            replay_and_extract_predicates(hdf_file, args.output_dir, sim_steps=args.sim_steps, sample_interval=args.sample_interval)
+            replay_and_extract_predicates(hdf_file, args.output_dir, sim_steps=args.sim_steps, sample_interval=args.sample_interval, force=args.force)
         except Exception as e:
             print(f"Error processing {hdf_file}: {e}")
             import traceback
