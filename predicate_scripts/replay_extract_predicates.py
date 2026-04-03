@@ -537,172 +537,321 @@ def get_goal_progress(env):
         return {"error": str(e)}
 
 
+def _is_already_complete(jsonl_path):
+    """Check if a JSONL output file already has a completed extraction."""
+    if not jsonl_path.exists():
+        return False
+    try:
+        with open(jsonl_path, 'r') as f:
+            lines = f.readlines()
+        if lines:
+            last_record = json.loads(lines[-1])
+            return last_record.get("done", False)
+    except Exception:
+        pass
+    return False
+
+
+def _process_hdf5_with_env(env, hdf5_path, output_dir, sim_steps, sample_interval, force=False):
+    """
+    Process a single HDF5 file using an already-loaded environment.
+
+    The env must already have the correct scene loaded (same task).
+    This avoids the expensive scene teardown/reload between same-task episodes.
+
+    Args:
+        env: DataPlaybackWrapper with scene already loaded
+        hdf5_path: Path to HDF5 file to process
+        output_dir: Output directory
+        sim_steps: Number of simulation steps after loading state
+        sample_interval: Sample every N frames
+        force: Force re-processing
+
+    Returns:
+        Path to output parquet file, or None if skipped
+    """
+    import h5py as h5
+    from omnigibson.utils.python_utils import h5py_group_to_torch, create_object_from_init_info
+    import torch as th
+
+    hdf5_path = Path(hdf5_path)
+    output_dir = Path(output_dir)
+    base_name = hdf5_path.stem
+    parquet_path = output_dir / f"{base_name}_predicates.parquet"
+    jsonl_path = output_dir / f"{base_name}_predicates.jsonl"
+
+    if not force and _is_already_complete(jsonl_path):
+        print(f"Skipping (already complete): {hdf5_path}", flush=True)
+        return str(parquet_path)
+
+    print(f"Processing: {hdf5_path}", flush=True)
+
+    task_name = env.task.activity_name if hasattr(env.task, 'activity_name') else "unknown"
+    all_records = []
+
+    # Incremental writing: open JSONL in append mode so crashes don't lose prior steps
+    jsonl_f = open(jsonl_path, 'w')
+
+    with h5.File(str(hdf5_path), 'r') as f:
+        data_grp = f["data"]
+        scene_file = json.loads(data_grp.attrs["scene_file"])
+        n_episodes = data_grp.attrs["n_episodes"]
+
+        for episode_id in range(n_episodes):
+            if f"demo_{episode_id}" not in data_grp:
+                continue
+
+            traj_grp = data_grp[f"demo_{episode_id}"]
+
+            # Load transitions (object slicing/dicing/cooking that create new objects mid-episode)
+            transitions = {}
+            if "transitions" in traj_grp.attrs:
+                try:
+                    transitions = json.loads(traj_grp.attrs["transitions"])
+                except Exception:
+                    pass
+
+            try:
+                traj_data = h5py_group_to_torch(traj_grp)
+                state = traj_data["state"]
+                state_size = traj_data["state_size"]
+                n_steps = len(state)
+            except Exception as e:
+                print(f"    Error loading episode {episode_id}: {e}")
+                continue
+
+            # Reset scene to this episode's initial state.
+            # Pre-clean: remove transition objects individually with error tolerance.
+            try:
+                scene = og.sim.scenes[0]
+                init_obj_names = set(scene_file["objects_info"]["init_info"].keys())
+                extra_objs = [
+                    scene.object_registry("name", name)
+                    for name in list(scene.object_registry.get_dict("name").keys())
+                    if name not in init_obj_names
+                ]
+                for obj in extra_objs:
+                    if obj is not None:
+                        try:
+                            scene.remove_object(obj)
+                        except (KeyError, Exception):
+                            pass
+                # Also clear any extra systems
+                init_sys_names = set(scene_file["state"]["registry"]["system_registry"].keys())
+                for sys_name in list(scene.active_systems.keys()):
+                    if sys_name not in init_sys_names:
+                        try:
+                            scene.clear_system(sys_name)
+                        except Exception:
+                            pass
+                env.scene.restore(scene_file, update_initial_file=True)
+
+                if "init_metadata" in traj_data:
+                    init_metadata = traj_data["init_metadata"]
+                    with og.sim.stopped():
+                        for i, obj in enumerate(env.scene.objects):
+                            for attr, vals in init_metadata.items():
+                                if i < len(vals):
+                                    val = vals[i]
+                                    setattr(obj, attr, val.item() if val.ndim == 0 else val)
+
+                env.reset()
+            except Exception as e:
+                print(f"    [{base_name}] ep {episode_id}: scene reset FAILED: {e}", flush=True)
+                continue
+
+            # Sort transition steps for this episode
+            transition_steps = sorted(int(k) for k in transitions.keys())
+            applied_transitions = set()
+
+            step_indices = [0] + list(range(sample_interval, n_steps, sample_interval))
+            if step_indices[-1] != n_steps - 1:
+                step_indices.append(n_steps - 1)
+
+            ep_step_count = 0
+            for step_idx in step_indices:
+                try:
+                    # Apply any transitions that should have occurred before this step
+                    scene = og.sim.scenes[0]
+                    for t_step in transition_steps:
+                        if t_step > step_idx:
+                            break
+                        if t_step in applied_transitions:
+                            continue
+                        applied_transitions.add(t_step)
+                        cur_transitions = transitions[str(t_step)]
+                        for add_sys_name in cur_transitions["systems"]["add"]:
+                            scene.get_system(add_sys_name, force_init=True)
+                        for remove_sys_name in cur_transitions["systems"]["remove"]:
+                            scene.clear_system(remove_sys_name)
+                        for remove_obj_name in cur_transitions["objects"]["remove"]:
+                            obj = scene.object_registry("name", remove_obj_name)
+                            if obj is not None:
+                                scene.remove_object(obj)
+                        for j, add_obj_info in enumerate(cur_transitions["objects"]["add"]):
+                            obj = create_object_from_init_info(add_obj_info)
+                            scene.add_object(obj)
+                            obj.set_position(th.ones(3) * 100.0 + th.ones(3) * 5 * j)
+                        og.sim.step()
+
+                    og.sim.load_state(state[step_idx, :int(state_size[step_idx])], serialized=True)
+                    for _ in range(sim_steps):
+                        og.sim.step()
+
+                    predicates = get_predicate_states_hierarchical(env)
+                except Exception as e:
+                    print(f"    [{base_name}] ep {episode_id} step {step_idx}: FAILED ({e})", flush=True)
+                    continue
+
+                total_count = len(predicates)
+                satisfied_count = sum(
+                    1 for p in predicates if p.get("satisfied", p.get("_satisfied", False))
+                )
+                progress_val = satisfied_count / total_count if total_count > 0 else 0.0
+                done = (satisfied_count == total_count) and total_count > 0
+
+                record = {
+                    "episode_id": episode_id,
+                    "step": step_idx,
+                    "task_name": task_name,
+                    "progress": progress_val,
+                    "done": done,
+                    "satisfied_count": satisfied_count,
+                    "total_count": total_count,
+                    "predicates": predicates,
+                }
+                all_records.append(record)
+
+                # Write immediately and flush — survives process crash
+                jsonl_f.write(json.dumps(record, cls=TorchEncoder) + '\n')
+                jsonl_f.flush()
+                ep_step_count += 1
+
+            print(f"    [{base_name}] ep {episode_id}: {n_steps} steps ({ep_step_count}/{len(step_indices)} samples ok)", flush=True)
+
+    jsonl_f.close()
+
+    df = pd.DataFrame(all_records)
+    df.to_parquet(parquet_path, index=False)
+
+    print(f"  Saved: {parquet_path}")
+    return str(parquet_path)
+
+
 def replay_and_extract_predicates(hdf_input_path, output_dir=None, sim_steps=5, sample_interval=1, force=False):
     """
     Replay a single HDF5 file and extract predicate states at each timestep.
+    Creates and tears down the environment for this single file.
 
-    Args:
-        hdf_input_path: Path to the HDF5 file to replay
-        output_dir: Output directory (default: same as input file)
-        sim_steps: Number of simulation steps after loading state (default: 5)
-        sample_interval: Sample every N frames (default: 1 = every frame)
-        force: Force re-processing even if output already exists
-    
-    Returns:
-        Path to output parquet file
+    For processing multiple files from the same task, use replay_and_extract_task_batch() instead.
     """
     hdf_input_path = Path(hdf_input_path)
-    
+
     if output_dir is None:
         output_dir = hdf_input_path.parent
     else:
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Output file paths
+
     base_name = hdf_input_path.stem
-    parquet_path = output_dir / f"{base_name}_predicates.parquet"
     jsonl_path = output_dir / f"{base_name}_predicates.jsonl"
-    
-    # Check if already completed (done=True in last record)
-    if not force and jsonl_path.exists():
-        try:
-            with open(jsonl_path, 'r') as f:
-                lines = f.readlines()
-            if lines:
-                last_record = json.loads(lines[-1])
-                if last_record.get("done", False):
-                    print(f"Skipping (already complete): {hdf_input_path}", flush=True)
-                    return str(parquet_path)
-        except Exception:
-            pass  # If we can't read it, re-process
-    
-    print(f"Processing: {hdf_input_path}", flush=True)
-    print(f"Output: {parquet_path}", flush=True)
-    
-    # Create playback environment
-    # We need include_task=True to get access to predicates
-    # output_path is required by the API even though we don't need it (it's designed
-    # to record new data while replaying). The wrapper may still create this file.
+
+    if not force and _is_already_complete(jsonl_path):
+        print(f"Skipping (already complete): {hdf_input_path}", flush=True)
+        return str(output_dir / f"{base_name}_predicates.parquet")
+
     tmp_output_path = output_dir / f"{base_name}_replay_tmp.hdf5"
     env = DataPlaybackWrapper.create_from_hdf5(
         input_path=str(hdf_input_path),
         output_path=str(tmp_output_path),
-        robot_obs_modalities=[],  # No visual obs needed
+        robot_obs_modalities=[],
         n_render_iterations=1,
         only_successes=False,
-        include_task=True,  # Required for predicates!
+        include_task=True,
         include_task_obs=False,
         include_robot_control=False,
-        include_contacts=True,  # Required for accurate predicate evaluation
+        include_contacts=True,
     )
-    
-    # Get task info
-    task_name = env.task.activity_name if hasattr(env.task, 'activity_name') else "unknown"
-    print(f"Task: {task_name}")
-    
-    # Collect all predicate data
-    all_records = []
-    
-    n_episodes = env.input_hdf5["data"].attrs["n_episodes"]
-    print(f"Episodes to process: {n_episodes}")
-    
-    for episode_id in range(n_episodes):
-        print(f"  Episode {episode_id}/{n_episodes-1}...")
-        
-        data_grp = env.input_hdf5["data"]
-        if f"demo_{episode_id}" not in data_grp:
-            print(f"    Skipping - demo_{episode_id} not found")
-            continue
-            
-        traj_grp = data_grp[f"demo_{episode_id}"]
-        
-        try:
-            # Load episode data
-            from omnigibson.utils.python_utils import h5py_group_to_torch
-            traj_data = h5py_group_to_torch(traj_grp)
-            state = traj_data["state"]
-            state_size = traj_data["state_size"]
-            n_steps = len(state)
-        except Exception as e:
-            print(f"    Error loading episode: {e}")
-            continue
-        
-        # Reset and restore initial state
-        env.scene.restore(env.scene_file, update_initial_file=True)
-        
-        # Reset object attributes from stored metadata
-        if "init_metadata" in traj_data:
-            init_metadata = traj_data["init_metadata"]
-            with og.sim.stopped():
-                for i, obj in enumerate(env.scene.objects):
-                    for attr, vals in init_metadata.items():
-                        if i < len(vals):
-                            val = vals[i]
-                            setattr(obj, attr, val.item() if val.ndim == 0 else val)
-        
-        env.reset()
-        
-        # Build list of steps to sample: first, every N frames, and last
-        step_indices = [0] + list(range(sample_interval, n_steps, sample_interval))
-        if step_indices[-1] != n_steps - 1:
-            step_indices.append(n_steps - 1)
-        
-        for step_idx in step_indices:
-            og.sim.load_state(state[step_idx, :int(state_size[step_idx])], serialized=True)
-            # Step to let physics settle and contacts update
-            # Contact detection requires physics simulation to register contacts
-            for _ in range(sim_steps):
-                og.sim.step()
 
-            # Extract predicates (single evaluate pass to avoid inconsistency)
-            predicates = get_predicate_states_hierarchical(env)
+    result = _process_hdf5_with_env(env, hdf_input_path, output_dir, sim_steps, sample_interval, force)
 
-            # Derive progress from the predicate tree directly
-            # (avoids double-evaluate bug where a second evaluate_goal_conditions()
-            #  call gives different results due to physics side effects)
-            total_count = len(predicates)
-            satisfied_count = sum(
-                1 for p in predicates if p.get("satisfied", p.get("_satisfied", False))
-            )
-            progress_val = satisfied_count / total_count if total_count > 0 else 0.0
-            done = (satisfied_count == total_count) and total_count > 0
-
-            all_records.append({
-                "episode_id": episode_id,
-                "step": step_idx,
-                "task_name": task_name,
-                "progress": progress_val,
-                "done": done,
-                "satisfied_count": satisfied_count,
-                "total_count": total_count,
-                "predicates": predicates,
-            })
-        
-        print(f"    Processed {n_steps} steps ({len(step_indices)} samples)")
-    
-    # Convert to DataFrame and save
-    df = pd.DataFrame(all_records)
-    
-    # Save as Parquet (efficient binary format)
-    df.to_parquet(parquet_path, index=False)
-    print(f"Saved Parquet: {parquet_path}")
-    
-    # Also save as JSONL for human readability
-    with open(jsonl_path, 'w') as f:
-        for record in all_records:
-            f.write(json.dumps(record, cls=TorchEncoder) + '\n')
-    print(f"Saved JSONL: {jsonl_path}")
-    
-    # Cleanup temp file created by DataPlaybackWrapper
     if tmp_output_path.exists():
         tmp_output_path.unlink()
-    
-    # Properly stop and clear environment before next file
     og.sim.stop()
     og.clear()
-    
-    return parquet_path
+
+    return result
+
+
+def replay_and_extract_task_batch(hdf5_files, output_dir, sim_steps=5, sample_interval=1, force=False):
+    """
+    Process multiple HDF5 files from the same task, loading the scene only once.
+
+    This avoids the ~120-150s scene load overhead per file. For a task with 200
+    episodes, this saves ~7-8 hours of startup time compared to per-file processing.
+
+    Args:
+        hdf5_files: List of HDF5 file paths (must all be from the same task)
+        output_dir: Output directory for predicate files
+        sim_steps: Number of simulation steps after loading state
+        sample_interval: Sample every N frames
+        force: Force re-processing
+    """
+    if not hdf5_files:
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Filter out already-completed files (unless force)
+    if not force:
+        pending = []
+        for f in hdf5_files:
+            jsonl_path = output_dir / f"{Path(f).stem}_predicates.jsonl"
+            if _is_already_complete(jsonl_path):
+                print(f"Skipping (already complete): {f}", flush=True)
+            else:
+                pending.append(f)
+        if not pending:
+            print("All files already complete, nothing to do.")
+            return
+    else:
+        pending = list(hdf5_files)
+
+    first_file = pending[0]
+    print(f"Loading scene from: {first_file}", flush=True)
+    print(f"Total files to process: {len(pending)}", flush=True)
+
+    tmp_output_path = output_dir / "batch_replay_tmp.hdf5"
+    env = DataPlaybackWrapper.create_from_hdf5(
+        input_path=str(first_file),
+        output_path=str(tmp_output_path),
+        robot_obs_modalities=[],
+        n_render_iterations=1,
+        only_successes=False,
+        include_task=True,
+        include_task_obs=False,
+        include_robot_control=False,
+        include_contacts=True,
+    )
+
+    task_name = env.task.activity_name if hasattr(env.task, 'activity_name') else "unknown"
+    print(f"Task: {task_name} — scene loaded, processing {len(pending)} files")
+
+    for i, hdf5_path in enumerate(pending):
+        try:
+            print(f"[{i+1}/{len(pending)}] {Path(hdf5_path).name}", flush=True)
+            _process_hdf5_with_env(env, hdf5_path, output_dir, sim_steps, sample_interval, force)
+        except Exception as e:
+            print(f"Error processing {hdf5_path}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if tmp_output_path.exists():
+        tmp_output_path.unlink()
+    og.sim.stop()
+    og.clear()
+    print(f"Task {task_name}: batch complete ({len(pending)} files)")
 
 
 def main():
@@ -713,57 +862,109 @@ def main():
 Examples:
   # Process single file
   python replay_extract_predicates.py --file demo.hdf5
-  
-  # Process directory
-  python replay_extract_predicates.py --dir /path/to/demos
-  
+
+  # Process all files in a task directory (scene loaded once)
+  python replay_extract_predicates.py --task-dir /path/to/task-0004
+
+  # Process directory (auto-groups by task subdirectory)
+  python replay_extract_predicates.py --dir /path/to/rawdata
+
   # Filter by pattern
-  python replay_extract_predicates.py --dir /path/to/demos --pattern task_name
+  python replay_extract_predicates.py --dir /path/to/demos --pattern task-0004
 """
     )
     parser.add_argument("--file", type=str, help="Single HDF5 file to process")
-    parser.add_argument("--dir", type=str, help="Directory containing HDF5 files")
-    parser.add_argument("--output-dir", type=str, default=None, 
+    parser.add_argument("--task-dir", type=str,
+                        help="Task directory containing HDF5 files (scene loaded once)")
+    parser.add_argument("--dir", type=str,
+                        help="Directory containing task subdirs (auto-groups by task)")
+    parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: same as input)")
     parser.add_argument("--pattern", type=str, default=None,
                         help="Only process files matching pattern")
     parser.add_argument("--sim-steps", type=int, default=5,
-                        help="Number of simulation steps after loading state (default: 5, use 0 for no stepping)")
+                        help="Number of simulation steps after loading state (default: 5)")
     parser.add_argument("--sample-interval", type=int, default=1,
                         help="Sample every N frames (default: 1 = every frame)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-processing even if output already exists")
+    parser.add_argument("--start", type=int, default=0,
+                        help="Start index for file list (for splitting across workers)")
+    parser.add_argument("--count", type=int, default=0,
+                        help="Number of files to process (0 = all remaining from --start)")
 
     args = parser.parse_args()
-    
+
+    def _slice_files(files):
+        """Apply --start/--count slicing to a sorted file list."""
+        files = sorted(files)
+        if args.start > 0:
+            files = files[args.start:]
+        if args.count > 0:
+            files = files[:args.count]
+        return files
+
     if args.file:
-        hdf_files = [args.file]
-    elif args.dir:
-        dir_path = Path(args.dir)
-        hdf_files = sorted(dir_path.rglob("*.hdf5"))
+        # Single file mode (original behavior)
+        replay_and_extract_predicates(
+            args.file, args.output_dir,
+            sim_steps=args.sim_steps, sample_interval=args.sample_interval, force=args.force,
+        )
+
+    elif args.task_dir:
+        # Task-batch mode: all HDF5s in one task dir, scene loaded once
+        task_path = Path(args.task_dir)
+        hdf5_files = sorted(f for f in task_path.glob("*.hdf5") if "_replay_tmp" not in f.name)
         if args.pattern:
-            hdf_files = [f for f in hdf_files if args.pattern in str(f)]
-        print(f"Found {len(hdf_files)} HDF5 files")
+            hdf5_files = [f for f in hdf5_files if args.pattern in str(f)]
+        hdf5_files = _slice_files(hdf5_files)
+        print(f"Found {len(hdf5_files)} HDF5 files in {task_path} (start={args.start}, count={args.count or 'all'})")
+        output_dir = args.output_dir or str(task_path)
+        replay_and_extract_task_batch(
+            hdf5_files, output_dir,
+            sim_steps=args.sim_steps, sample_interval=args.sample_interval, force=args.force,
+        )
+
+    elif args.dir:
+        # Directory mode: auto-group by task subdirectory
+        from collections import defaultdict
+        dir_path = Path(args.dir)
+        all_files = sorted(dir_path.rglob("*.hdf5"))
+        if args.pattern:
+            all_files = [f for f in all_files if args.pattern in str(f)]
+        print(f"Found {len(all_files)} HDF5 files")
+
+        # Group by parent directory (= task directory)
+        task_groups = defaultdict(list)
+        for f in all_files:
+            task_groups[f.parent].append(f)
+
+        print(f"Grouped into {len(task_groups)} tasks")
+        for task_dir in sorted(task_groups.keys()):
+            files = task_groups[task_dir]
+            output_dir = args.output_dir or str(task_dir)
+            print(f"\n{'='*60}")
+            print(f"Task: {task_dir.name} ({len(files)} files)")
+            print(f"{'='*60}")
+            try:
+                replay_and_extract_task_batch(
+                    files, output_dir,
+                    sim_steps=args.sim_steps, sample_interval=args.sample_interval, force=args.force,
+                )
+            except Exception as e:
+                print(f"Error processing task {task_dir.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    og.sim.stop()
+                    og.clear()
+                except Exception:
+                    pass
     else:
         parser.print_help()
-        print("\nError: Either --file or --dir must be specified")
+        print("\nError: Either --file, --task-dir, or --dir must be specified")
         return
-    
-    # Process each file
-    for hdf_file in hdf_files:
-        try:
-            replay_and_extract_predicates(hdf_file, args.output_dir, sim_steps=args.sim_steps, sample_interval=args.sample_interval, force=args.force)
-        except Exception as e:
-            print(f"Error processing {hdf_file}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Cleanup after error to ensure next file can be processed
-            try:
-                og.sim.stop()
-                og.clear()
-            except Exception:
-                pass
-    
+
     og.shutdown()
     print("\nDone!")
 
