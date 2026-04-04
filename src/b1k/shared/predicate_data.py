@@ -1,9 +1,12 @@
-"""Predicate data loader for BEHAVIOR-1K.
+"""Predicate data loader for Exp 3 (Full V2) — with progress + structured metadata.
 
-Loads precomputed state vectors indicating which objects are at their final positions.
-All data is loaded into memory at initialization for fast access during training.
+CHANGES from V1:
+- get_predicate_state() returns 3-tuple (binary, mask, progress)
+- get_predicate_metadata() returns (name_ids, arg_ids, type_ids) per predicate
+- Reads predicate_types, predicate_names from .pkl metadata
 """
 
+import json
 import logging
 import os
 import pickle
@@ -12,182 +15,176 @@ import numpy as np
 
 logger = logging.getLogger("b1k")
 
+# Default vocab (will be overridden by build_predicate_vocab.py output)
+DEFAULT_NAME_VOCAB = {
+    "inside": 0, "ontop": 1, "nextto": 2, "under": 3, "attached": 4,
+    "open": 5, "cooked": 6, "covered": 7, "real": 8, "contains": 9,
+    "onfloor": 10, "toggled_on": 11, "saturated": 12, "filled": 13,
+    "overlaid": 14, "draped": 15, "folded": 16, "unknown": 17,
+}
+
+DEFAULT_TYPE_VOCAB = {"atomic": 0, "forall": 1, "exists": 2, "not": 3, "forpairs": 4, "or": 5}
+
 
 class PredicateDataStore:
-    """In-memory store for predicate state vectors.
-    
-    Loads all predicate data at initialization for fast access during training.
-    
-    Structure per task:
-        - demo_vectors: Dict[episode_id_str, {'states': [T, num_items], 'actions': [T, num_items]}]
-        - item_to_index: Dict mapping item names to indices
-        - index_to_item: Dict mapping indices to item names
-        - num_items: Number of items (predicates) for this task
-    
-    Usage:
-        store = PredicateDataStore("/path/to/predicate_data")
-        predicate_states, predicate_mask = store.get_predicate_state(
-            task_id=5, episode_id=10, frame_idx=1000
-        )
-    """
-    
-    def __init__(self, predicate_data_path: str):
-        """Load all predicate data into memory.
-        
-        Args:
-            predicate_data_path: Path to directory containing task_XXXX_state_action_vectors.pkl files
-        """
+    """In-memory store with structured predicate metadata for Deep Sets."""
+
+    def __init__(self, predicate_data_path: str, vocab_dir: str | None = None):
         self.data_path = predicate_data_path
         self.task_data: Dict[int, dict] = {}
         self.max_num_predicates = 0
-        
-        # Load all task data
+
+        # Load vocab mappings
+        self.name_vocab = DEFAULT_NAME_VOCAB
+        self.type_vocab = DEFAULT_TYPE_VOCAB
+        self.arg_vocab: Dict[str, int] = {}
+
+        if vocab_dir and os.path.exists(vocab_dir):
+            name_path = os.path.join(vocab_dir, "predicate_name_to_id.json")
+            arg_path = os.path.join(vocab_dir, "predicate_arg_to_id.json")
+            if os.path.exists(name_path):
+                with open(name_path) as f:
+                    self.name_vocab = json.load(f)
+            if os.path.exists(arg_path):
+                with open(arg_path) as f:
+                    self.arg_vocab = json.load(f)
+
         self._load_all_data()
-        
-        logger.info(f"PredicateDataStore initialized with {len(self.task_data)} tasks, "
-                   f"max_predicates={self.max_num_predicates}")
-    
+        logger.info(f"PredicateDataStore V2 initialized with {len(self.task_data)} tasks, "
+                    f"name_vocab={len(self.name_vocab)}, arg_vocab={len(self.arg_vocab)}")
+
     def _load_all_data(self):
-        """Load all state_action_vectors.pkl files into memory."""
         if not os.path.exists(self.data_path):
             raise FileNotFoundError(f"Predicate data path not found: {self.data_path}")
-        
-        # Find all task files
+
         for task_id in range(50):
             filename = f"task_{task_id:04d}_state_action_vectors.pkl"
             filepath = os.path.join(self.data_path, filename)
-            
             if os.path.exists(filepath):
                 with open(filepath, 'rb') as f:
                     task_data = pickle.load(f)
-                
-                # Validate structure
                 if 'demo_vectors' not in task_data or 'num_items' not in task_data:
-                    logger.warning(f"Invalid data structure in {filename}, skipping")
                     continue
-                
                 self.task_data[task_id] = task_data
                 self.max_num_predicates = max(self.max_num_predicates, task_data['num_items'])
-                
-                # Log some stats
-                num_demos = len(task_data['demo_vectors'])
-                num_items = task_data['num_items']
-                logger.debug(f"Loaded task {task_id}: {num_demos} demos, {num_items} items")
-            else:
-                logger.warning(f"Missing predicate data for task {task_id}: {filepath}")
-        
+
         if len(self.task_data) == 0:
             raise RuntimeError(f"No predicate data files found in {self.data_path}")
-        
-        logger.info(f"Loaded predicate data for {len(self.task_data)} tasks")
-    
-    def get_predicate_state(
-        self, 
-        task_id: int, 
-        episode_id: int, 
-        frame_idx: int,
-        max_predicates: int = 20
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Get predicate state for a specific frame.
-        
-        Args:
-            task_id: Task index (0-49)
-            episode_id: Episode index from dataset
-            frame_idx: Frame index within episode
-            max_predicates: Maximum number of predicates to pad to
-            
-        Returns:
-            predicate_states: [max_predicates] bool array, True = object is done
-            predicate_mask: [max_predicates] bool array, True = valid predicate
-        """
-        # Initialize output arrays
-        predicate_states = np.zeros(max_predicates, dtype=bool)
-        predicate_mask = np.zeros(max_predicates, dtype=bool)
-        
-        # Check if task exists
-        if task_id not in self.task_data:
-            logger.warning(f"Task {task_id} not found in predicate data, returning zeros")
-            return predicate_states, predicate_mask
-        
-        task_data = self.task_data[task_id]
-        num_items = task_data['num_items']
-        demo_vectors = task_data['demo_vectors']
-        
-        # Format episode_id to match stored format (8-digit string like "00010010")
-        # First 4 digits = task_id, last 4 digits = demo number within task
-        # But the stored format might vary, so we try multiple formats
-        episode_id_str = None
-        
-        # Try different formats
+
+    def _find_episode(self, demo_vectors, task_id, episode_id):
         candidates = [
-            f"{episode_id:08d}",  # Full 8-digit
-            f"{task_id:04d}{episode_id % 10000:04d}",  # task_id + demo_num
-            str(episode_id),  # Plain number
+            f"{episode_id:08d}",
+            f"{task_id:04d}{episode_id % 10000:04d}",
+            str(episode_id),
         ]
-        
         for candidate in candidates:
             if candidate in demo_vectors:
-                episode_id_str = candidate
-                break
-        
-        if episode_id_str is None:
-            # Try to find by substring matching
-            for stored_key in demo_vectors.keys():
-                if str(episode_id) in stored_key or stored_key.endswith(f"{episode_id % 10000:04d}"):
-                    episode_id_str = stored_key
+                return candidate
+        for stored_key in demo_vectors.keys():
+            if str(episode_id) in stored_key or stored_key.endswith(f"{episode_id % 10000:04d}"):
+                return stored_key
+        return None
+
+    def get_predicate_state(
+        self, task_id: int, episode_id: int, frame_idx: int, max_predicates: int = 20
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns (binary_states, mask, progress) arrays."""
+        states = np.zeros(max_predicates, dtype=bool)
+        mask = np.zeros(max_predicates, dtype=bool)
+        progress = np.zeros(max_predicates, dtype=np.float32)
+
+        if task_id not in self.task_data:
+            return states, mask, progress
+
+        task_data = self.task_data[task_id]
+        num_items = task_data['num_items']
+        ep_str = self._find_episode(task_data['demo_vectors'], task_id, episode_id)
+        if ep_str is None:
+            return states, mask, progress
+
+        ep_states = task_data['demo_vectors'][ep_str]['states']
+        frame_idx = max(0, min(frame_idx, ep_states.shape[0] - 1))
+        frame_vals = ep_states[frame_idx]
+
+        states[:num_items] = (frame_vals >= 0.5).astype(bool)
+        mask[:num_items] = True
+        progress[:num_items] = frame_vals.astype(np.float32)
+
+        return states, mask, progress
+
+    def get_predicate_metadata(
+        self, task_id: int, max_predicates: int = 20
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Get structured metadata for Deep Sets encoder.
+
+        Returns:
+            name_ids: [max_predicates] int — predicate name index (shared across tasks)
+            arg_ids: [max_predicates] int — primary entity argument index
+            type_ids: [max_predicates] int — 0=atomic, 1=forall, 2=exists
+        """
+        name_ids = np.zeros(max_predicates, dtype=np.int32)
+        arg_ids = np.zeros(max_predicates, dtype=np.int32)
+        type_ids = np.zeros(max_predicates, dtype=np.int32)
+
+        if task_id not in self.task_data:
+            return name_ids, arg_ids, type_ids
+
+        task_data = self.task_data[task_id]
+        num_items = task_data['num_items']
+
+        # Get predicate types from .pkl metadata
+        pred_types = task_data.get('predicate_types', ['atomic'] * num_items)
+        # Get predicate names from index_to_item
+        index_to_item = task_data.get('index_to_item', {})
+
+        for i in range(min(num_items, max_predicates)):
+            # Type ID
+            ptype = pred_types[i] if i < len(pred_types) else 'atomic'
+            type_ids[i] = self.type_vocab.get(ptype, 0)
+
+            # Name ID — extract predicate verb from item name
+            item_name = index_to_item.get(i, "unknown")
+            # item_name might be like "inside" or "forall_pumpkin.n.02"
+            matched = False
+            for name, nid in self.name_vocab.items():
+                if name in item_name:
+                    name_ids[i] = nid
+                    matched = True
                     break
-        
-        if episode_id_str is None:
-            logger.debug(f"Episode {episode_id} not found for task {task_id}, returning zeros")
-            return predicate_states, predicate_mask
-        
-        # Get state vector for this frame
-        states = demo_vectors[episode_id_str]['states']  # [T, num_items]
-        
-        # Clamp frame_idx to valid range
-        frame_idx = max(0, min(frame_idx, states.shape[0] - 1))
-        
-        # Get predicate states for this frame
-        frame_states = states[frame_idx]  # [num_items]
-        
-        # Fill output arrays
-        predicate_states[:num_items] = frame_states.astype(bool)
-        predicate_mask[:num_items] = True
-        
-        return predicate_states, predicate_mask
-    
+            if not matched:
+                name_ids[i] = self.name_vocab.get("unknown", len(self.name_vocab) - 1)
+
+            # Arg ID — extract entity category from item name
+            # For now, use a hash-based approach if no vocab
+            if self.arg_vocab:
+                for arg_name, aid in self.arg_vocab.items():
+                    if arg_name in item_name:
+                        arg_ids[i] = aid
+                        break
+
+        return name_ids, arg_ids, type_ids
+
     def get_num_predicates(self, task_id: int) -> int:
-        """Get number of predicates for a task."""
         if task_id in self.task_data:
             return self.task_data[task_id]['num_items']
         return 0
-    
+
     def get_item_names(self, task_id: int) -> Dict[int, str]:
-        """Get item index to name mapping for a task."""
         if task_id in self.task_data:
             return self.task_data[task_id].get('index_to_item', {})
         return {}
 
 
-# Global singleton instance (lazy initialization)
 _predicate_store: Optional[PredicateDataStore] = None
 
 
-def get_predicate_store(predicate_data_path: str) -> PredicateDataStore:
-    """Get or create the global predicate data store.
-    
-    Uses lazy initialization with singleton pattern for efficiency.
-    """
+def get_predicate_store(predicate_data_path: str, vocab_dir: str | None = None) -> PredicateDataStore:
     global _predicate_store
-    
     if _predicate_store is None:
-        logger.info(f"Initializing PredicateDataStore from {predicate_data_path}")
-        _predicate_store = PredicateDataStore(predicate_data_path)
-    
+        _predicate_store = PredicateDataStore(predicate_data_path, vocab_dir)
     return _predicate_store
 
 
 def reset_predicate_store():
-    """Reset the global predicate store (for testing)."""
     global _predicate_store
     _predicate_store = None

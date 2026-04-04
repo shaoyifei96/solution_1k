@@ -60,15 +60,34 @@ class PiBehaviorWeightLoader(WeightLoader):
         has_task_embeddings = 'task_embeddings' in loaded_params
         
         if has_task_embeddings:
-            # Loading PI_BEHAVIOR checkpoint - load ALL weights from checkpoint
-            logging.info("Loading PI_BEHAVIOR checkpoint (all weights will be loaded)")
-            # Use _merge_params with empty missing_regex to validate shapes
-            return _merge_params(loaded_params, params, missing_regex="^$")
+            # Loading PI_BEHAVIOR checkpoint — V2 Full: filter removed V1 params + init new
+            logging.info("Loading PI_BEHAVIOR checkpoint (V2 Full: filter removed + init new)")
+
+            # Filter out removed V1 params from loaded checkpoint
+            removed_prefixes = [
+                "task_predicate_embeddings", "gate_done", "gate_remaining",
+                "gate_task", "fusion_layer1", "fusion_layer2", "predicate_projection",
+            ]
+            filtered_loaded = {}
+            for key, value in loaded_params.items():
+                skip = any(prefix in key for prefix in removed_prefixes)
+                if skip:
+                    logging.info(f"  Skipping removed V1 param: {key}")
+                else:
+                    filtered_loaded[key] = value
+
+            # New V2 params to random-init
+            missing_regex = (
+                ".*pred_type_emb.*|.*pred_name_emb.*|.*pred_arg_emb.*|"
+                ".*phi_fc.*|.*rho_fc.*|"
+                ".*forall_fc.*|.*exists_fc.*|"
+                ".*pred_token_proj.*|"
+                ".*progress_pred_from_vlm.*"
+            )
+            return _merge_params(filtered_loaded, params, missing_regex=missing_regex)
         else:
-            # Loading Pi05 checkpoint - preserve new PI_BEHAVIOR-specific parameters
-            logging.info("Loading Pi05 checkpoint (new PI_BEHAVIOR parameters will use random init)")
-            
-            # These parameters are NEW in PI_BEHAVIOR (not in Pi05), so keep them from params (random init)
+            # Loading Pi05 checkpoint
+            logging.info("Loading Pi05 checkpoint (all V2 parameters will use random init)")
             missing_regex = (
                 ".*task_embeddings.*|"
                 ".*stage_pred_from_vlm.*|"
@@ -81,6 +100,12 @@ class PiBehaviorWeightLoader(WeightLoader):
                 ".*task_subtask_fusion.*|"
                 ".*fast_token_embedding.*|"
                 ".*fast_token_proj.*|"
-                ".*kv_transform.*"
+                ".*kv_transform.*|"
+                ".*pred_type_emb.*|.*pred_name_emb.*|.*pred_arg_emb.*|"
+                ".*phi_fc.*|.*rho_fc.*|"
+                ".*forall_fc.*|.*exists_fc.*|"
+                ".*pred_token_proj.*|"
+                ".*progress_pred_from_vlm.*|"
+                ".*predicate_pred_from_vlm.*"
             )
             return _merge_params(loaded_params, params, missing_regex=missing_regex)

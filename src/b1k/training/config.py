@@ -334,7 +334,7 @@ class TrainConfig:
 _CONFIGS = [
     TrainConfig(
         name="pi_behavior_b1k_fast",
-        exp_name="b1k_predicate_ckpt_50t",
+        exp_name="exp3_v2_full",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
@@ -350,8 +350,9 @@ _CONFIGS = [
             use_kv_transform=True,
             use_knowledge_insulation=False,
             freeze_vision_backbone=True,
-            predicate_data_path="/vast/projects/kumar/lab/yishao/data/predicate_data/predicate_data",
+            predicate_data_path="/pool/yishao/v2_extract/predicate_data",  # V2; B200: /vast/.../predicate_data_v2
             predicate_loss_weight=0.1,
+            progress_loss_weight=0.05,
         ),
         data=LeRobotB1KDataConfig(
             repo_id="IliaLarchenko/behavior_224_rgb",

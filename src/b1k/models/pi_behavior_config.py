@@ -106,7 +106,10 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Predicate prediction auxiliary loss weight (relative to action loss)
     # Uses BCE loss for multi-label binary classification
     predicate_loss_weight: float = 0.1
-    
+
+    # V2: Progress regression loss weight
+    progress_loss_weight: float = 0.05
+
     # Path to predicate data directory containing state_action_vectors.pkl files
     predicate_data_path: str = "data/predicate_data"
     
