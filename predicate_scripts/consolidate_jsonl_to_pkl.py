@@ -78,51 +78,48 @@ def process_task(task_dir: Path) -> dict:
     if not jsonl_files:
         return None
 
-    # Group records by episode
-    episodes = defaultdict(list)
+    # Each JSONL file = one episode (episode_id inside is always 0)
+    # Use filename as the episode key: episode_00020010_predicates.jsonl -> "00020010"
+    demo_vectors = {}
+    predicate_names = None
+    predicate_types = None
+    is_binary = None
+    num_predicates = None
 
     for jsonl_path in jsonl_files:
+        # Extract episode ID from filename
+        fname = jsonl_path.stem.replace("_predicates", "")
+        ep_id_str = fname.replace("episode_", "")
+
+        records = []
         with open(jsonl_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    record = json.loads(line)
+                    records.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                ep_id = record["episode_id"]
-                episodes[ep_id].append(record)
 
-    if not episodes:
-        return None
+        if not records:
+            continue
 
-    # Determine predicate structure from first episode's first record
-    first_ep = next(iter(episodes.values()))
-    first_record = first_ep[0]
-    predicates_template = first_record["predicates"]
-    num_predicates = len(predicates_template)
+        # Initialize predicate metadata from first file
+        if predicate_names is None:
+            predicates_template = records[0]["predicates"]
+            num_predicates = len(predicates_template)
+            predicate_names = []
+            predicate_types = []
+            is_binary = []
+            for p in predicates_template:
+                predicate_names.append(get_predicate_name(p))
+                ptype = p.get("type", "atomic")
+                predicate_types.append(ptype)
+                is_binary.append(ptype == "atomic")
 
-    # Build predicate names, types, is_binary
-    predicate_names = []
-    predicate_types = []
-    is_binary = []
-    for p in predicates_template:
-        predicate_names.append(get_predicate_name(p))
-        ptype = p.get("type", "atomic")
-        predicate_types.append(ptype)
-        is_binary.append(ptype == "atomic")
-
-    item_to_index = {name: i for i, name in enumerate(predicate_names)}
-    index_to_item = {i: name for i, name in enumerate(predicate_names)}
-
-    # Build demo_vectors
-    demo_vectors = {}
-
-    for ep_id, records in episodes.items():
-        # Sort by step
+        # Sort by step and build state matrix
         records.sort(key=lambda r: r["step"])
-
         T = len(records)
         states = np.zeros((T, num_predicates), dtype=np.float32)
 
@@ -131,24 +128,16 @@ def process_task(task_dir: Path) -> dict:
                 if i < num_predicates:
                     states[t, i] = compute_predicate_value(pred)
 
-        # Episode ID: extract from JSONL filename or use formatted ID
-        # Files are named like episode_00020010_predicates.jsonl
-        # The episode_id in the record is the within-file index (0, 1, ...)
-        # We need to match PredicateDataStore's lookup format
-        jsonl_file = [f for f in jsonl_files if any(
-            r["episode_id"] == ep_id for r in records[:1]
-        )]
-        if jsonl_file:
-            # Use the numeric part from filename: episode_00020010 -> "00020010"
-            fname = jsonl_file[0].stem.replace("_predicates", "")
-            ep_id_str = fname.replace("episode_", "")
-        else:
-            ep_id_str = f"{ep_id:08d}"
-
         demo_vectors[ep_id_str] = {
             "states": states,
-            "actions": np.zeros_like(states),  # unused placeholder
+            "actions": np.zeros_like(states),
         }
+
+    if not demo_vectors or predicate_names is None:
+        return None
+
+    item_to_index = {name: i for i, name in enumerate(predicate_names)}
+    index_to_item = {i: name for i, name in enumerate(predicate_names)}
 
     return {
         "demo_vectors": demo_vectors,
