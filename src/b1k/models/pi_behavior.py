@@ -162,8 +162,9 @@ class PiBehavior(_model.BaseModel):
         self.exists_fc1 = nnx.Linear(self.predicate_encoding_dim + 1, self.predicate_encoding_dim, rngs=rngs)
         self.exists_fc2 = nnx.Linear(self.predicate_encoding_dim, self.predicate_encoding_dim, rngs=rngs)
 
-        # rho: post-aggregation MLP [1024] -> 1024 -> 2048
-        self.rho_fc1 = nnx.Linear(self.predicate_encoding_dim, self.predicate_encoding_dim, rngs=rngs)
+        # rho: post-aggregation MLP [1024+1] -> 1024 -> 2048
+        # +1 for predicate count (so rho knows the scale of the sum)
+        self.rho_fc1 = nnx.Linear(self.predicate_encoding_dim + 1, self.predicate_encoding_dim, rngs=rngs)
         self.rho_fc2 = nnx.Linear(self.predicate_encoding_dim, config.task_embedding_dim, rngs=rngs)
 
         # Project Deep Sets output to 4 task tokens
@@ -467,13 +468,18 @@ class PiBehavior(_model.BaseModel):
         is_exists = (type_ids == 2)[..., None]
         pred_embs = jnp.where(is_forall, forall_out, jnp.where(is_exists, exists_out, phi_out))
 
-        # Layer 3: Masked sum aggregation (Deep Sets)
+        # Layer 3: Masked sum aggregation (Deep Sets — sum, not mean)
         mask = obs.predicate_mask[..., None].astype(jnp.float32)  # [B, P, 1]
         summed = jnp.sum(pred_embs * mask, axis=1)  # [B, 1024]
 
+        # Append predicate count so rho knows the scale of the sum
+        # (1 predicate sum vs 20 predicates sum differ 20x — rho needs this info)
+        num_valid = jnp.sum(obs.predicate_mask.astype(jnp.float32), axis=1, keepdims=True)  # [B, 1]
+        rho_input = jnp.concatenate([summed, num_valid], axis=-1)  # [B, 1025]
+
         # rho MLP
-        rho_h = nnx.relu(self.rho_fc1(summed))  # [B, 1024]
-        predicate_repr = self.rho_fc2(rho_h)     # [B, 2048]
+        rho_h = nnx.relu(self.rho_fc1(rho_input))  # [B, 1024]
+        predicate_repr = self.rho_fc2(rho_h)         # [B, 2048]
 
         # Project to 4 tokens to match V1 structure
         tokens_flat = self.pred_token_proj(predicate_repr)  # [B, 4*2048]
