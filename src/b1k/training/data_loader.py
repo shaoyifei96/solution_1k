@@ -310,6 +310,54 @@ def extract_episode_lengths_from_dataset(dataset) -> dict[int, float]:
     return episode_lengths
 
 
+def create_local_h5_behavior_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    seed: int | None = None,
+) -> Dataset:
+    """Create a BEHAVIOR-1K dataset from local parquet + H5/MP4 files.
+
+    This is the local-data alternative to create_behavior_dataset() that avoids
+    the dependency on BehaviorLeRobotDataset and the /vast/ remote filesystem.
+
+    Args:
+        data_config: Data configuration with local_parquet_root, local_h5_root set.
+        action_horizon: Action horizon for future action stacking.
+        seed: Random seed for shuffling.
+
+    Returns:
+        Dataset instance compatible with OpenPI transforms.
+    """
+    from b1k.training.local_h5_dataset import create_local_h5_dataset
+
+    if seed is None:
+        seed = int(time.time() * 1000) % (2**32)
+        logging.info(f"Using random seed for LocalH5Dataset: {seed}")
+
+    if data_config.local_parquet_root is None:
+        raise ValueError("local_parquet_root must be set when use_local_h5=True")
+
+    dataset = create_local_h5_dataset(
+        parquet_root=data_config.local_parquet_root,
+        h5_root=data_config.local_h5_root,
+        video_root=data_config.local_video_root,
+        tasks=None,  # All 50 tasks
+        action_horizon=action_horizon,
+        image_size=224,
+        shuffle=True,
+        seed=seed,
+        h5_cache_size=128,
+    )
+
+    logging.info(
+        f"Created LocalH5Dataset: {len(dataset)} samples, "
+        f"parquet={data_config.local_parquet_root}, "
+        f"h5={data_config.local_h5_root}"
+    )
+
+    return dataset
+
+
 def create_behavior_data_loader(
     config: _config.TrainConfig,
     *,
@@ -318,20 +366,36 @@ def create_behavior_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
 ) -> DataLoader:
-    """Create a data loader for BEHAVIOR-1K training."""
+    """Create a data loader for BEHAVIOR-1K training.
+
+    Automatically uses LocalH5Dataset when data_config.use_local_h5 is True,
+    otherwise falls back to BehaviorLeRobotDataset.
+    """
     import jax
     import time
-    
+
     data_config = config.data.create(config.assets_dirs, config.model)
-    
+
     # Use random seed if not provided
     seed = config.seed
     if seed is None:
         seed = int(time.time() * 1000) % (2**32)
         logging.info(f"Using random seed: {seed}")
-    
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, model_config=config.model)
+
+    # Choose dataset backend
+    if data_config.use_local_h5:
+        logging.info("Using local H5/parquet dataset (use_local_h5=True)")
+        dataset = create_local_h5_behavior_dataset(
+            data_config, action_horizon=config.model.action_horizon, seed=seed
+        )
+    else:
+        dataset = create_behavior_dataset(
+            data_config, action_horizon=config.model.action_horizon, seed=seed
+        )
+
+    dataset = transform_dataset(
+        dataset, data_config, skip_norm_stats=skip_norm_stats, model_config=config.model
+    )
 
     data_loader = TorchDataLoader(
         dataset,
@@ -343,7 +407,7 @@ def create_behavior_data_loader(
         prefetch_factor=config.prefetch_factor,
         seed=seed,
     )
-    
+
     return DataLoaderImpl(data_config, data_loader)
 
 
@@ -399,8 +463,16 @@ def create_behavior_data_loader_grain(
         logging.info(f"Using random seed: {seed}")
     
     # Create base dataset (without transforms)
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
-    
+    if data_config.use_local_h5:
+        logging.info("Using local H5/parquet dataset for Grain loader (use_local_h5=True)")
+        dataset = create_local_h5_behavior_dataset(
+            data_config, action_horizon=config.model.action_horizon, seed=seed
+        )
+    else:
+        dataset = create_behavior_dataset(
+            data_config, action_horizon=config.model.action_horizon, seed=seed
+        )
+
     # Build transform list with B1K-specific per-timestamp normalization
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
