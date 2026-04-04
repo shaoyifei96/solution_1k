@@ -89,8 +89,18 @@ class DataConfig:
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
 
-    # Episodes index to use for training 
+    # Episodes index to use for training
     episodes_index: List[int] | None = None
+
+    # --- Local H5 dataset configuration ---
+    # If True, use LocalH5Dataset instead of BehaviorLeRobotDataset.
+    use_local_h5: bool = False
+    # Root directory for parquet files (states, actions, metadata).
+    local_parquet_root: str | None = None
+    # Root directory for H5 frame files (pre-extracted JPEG blobs).
+    local_h5_root: str | None = None
+    # Root directory for video files (MP4 fallback when H5 is missing).
+    local_video_root: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -334,7 +344,7 @@ class TrainConfig:
 _CONFIGS = [
     TrainConfig(
         name="pi_behavior_b1k_fast",
-        exp_name="b1k_predicate_ckpt_50t",
+        exp_name="exp2_v2_progress_pertype",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
@@ -350,8 +360,9 @@ _CONFIGS = [
             use_kv_transform=True,
             use_knowledge_insulation=False,
             freeze_vision_backbone=True,
-            predicate_data_path="/vast/projects/kumar/lab/yishao/data/predicate_data/predicate_data",
+            predicate_data_path="/pool/yishao/v2_extract/predicate_data",  # V2 data; B200: /vast/projects/kumar/lab/yishao/data/predicate_data_v2
             predicate_loss_weight=0.1,
+            progress_loss_weight=0.05,
         ),
         data=LeRobotB1KDataConfig(
             repo_id="IliaLarchenko/behavior_224_rgb",
@@ -380,6 +391,58 @@ _CONFIGS = [
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
         checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
         num_workers=64, # for torch or grain total
+        save_interval=500,
+        keep_period=2000,
+    ),
+    # Local H5 variant -- same model config, reads from local parquet + H5/MP4 on kumarlab02
+    TrainConfig(
+        name="pi_behavior_b1k_fast_local",
+        exp_name="exp1_v2data_v1arch",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            freeze_vision_backbone=True,
+            predicate_data_path="/pool/yishao/v2_extract/predicate_data",
+            predicate_loss_weight=0.1,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="IliaLarchenko/behavior_224_rgb",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root=None,  # Not used for local H5
+                use_per_timestamp_norm=True,
+                use_local_h5=True,
+                local_parquet_root="/pool/yishao/raw_data/2025-challenge-demos/data",
+                local_h5_root="/pool/yishao/training_data/VLA_DS_processed/frames_h5",
+                local_video_root="/pool/yishao/raw_data/2025-challenge-demos/videos",
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=200_000,
+        assets_base_dir="/pool/yishao/training_data/assets",
+        checkpoint_base_dir="/pool/yishao/training_data/checkpoints",
+        num_workers=32,
         save_interval=500,
         keep_period=2000,
     ),

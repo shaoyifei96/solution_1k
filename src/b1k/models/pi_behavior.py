@@ -175,7 +175,15 @@ class PiBehavior(_model.BaseModel):
         
         # Additional projection for remaining-focus representation
         self.predicate_projection = nnx.Linear(2 * self.predicate_encoding_dim, config.task_embedding_dim, rngs=rngs)
-        
+
+        # V2: Per-type predicate modules (progress-aware)
+        self.forall_fc1 = nnx.Linear(self.predicate_encoding_dim + 1, self.predicate_encoding_dim, rngs=rngs)
+        self.forall_fc2 = nnx.Linear(self.predicate_encoding_dim, self.predicate_encoding_dim, rngs=rngs)
+        self.exists_fc1 = nnx.Linear(self.predicate_encoding_dim + 1, self.predicate_encoding_dim, rngs=rngs)
+        self.exists_fc2 = nnx.Linear(self.predicate_encoding_dim, self.predicate_encoding_dim, rngs=rngs)
+        # V2: Progress prediction head (MSE loss)
+        self.progress_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_PREDICATES, rngs=rngs)
+
         # Pi05 style layers
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -421,56 +429,51 @@ class PiBehavior(_model.BaseModel):
 
     def aggregate_predicate_embeddings(
         self,
-        task_ids: at.Int[at.Array, " b"],
-        predicate_states: at.Bool[at.Array, "b p"],
-        predicate_mask: at.Bool[at.Array, "b p"],
-    ) -> tuple[at.Float[at.Array, "b d"], at.Float[at.Array, "b d"]]:
-        """Aggregate predicate embeddings into done and remaining representations.
-        
-        Args:
-            task_ids: [B] Task IDs for task-specific predicate embeddings
-            predicate_states: [B, P] True = predicate is done
-            predicate_mask: [B, P] True = predicate is valid for this task
-            
-        Returns:
-            done_agg: [B, 1024] Mean of done predicate embeddings
-            remaining_agg: [B, 1024] Mean of remaining predicate embeddings
-        """
-        batch_size = task_ids.shape[0]
-        
-        # Get all predicate embeddings for each sample
-        # We need to gather embeddings for all predicates of each task
+        task_ids,
+        predicate_states,
+        predicate_mask,
+        predicate_progress=None,
+    ):
+        """Aggregate predicate embeddings with per-type progress modules."""
         task_pred_offsets = jnp.array(TASK_PREDICATE_OFFSETS, dtype=jnp.int32)
         task_num_preds = jnp.array(TASK_NUM_PREDICATES, dtype=jnp.int32)
-        
-        offsets = task_pred_offsets[task_ids]  # [B]
-        num_preds = task_num_preds[task_ids]   # [B]
-        
-        # Build indices for all predicates: [B, MAX_NUM_PREDICATES]
-        pred_range = jnp.arange(MAX_NUM_PREDICATES)  # [P]
-        pred_indices = offsets[:, None] + pred_range[None, :]  # [B, P]
-        
-        # Clamp indices to valid range (for predicates beyond task's count)
+
+        offsets = task_pred_offsets[task_ids]
+        pred_range = jnp.arange(MAX_NUM_PREDICATES)
+        pred_indices = offsets[:, None] + pred_range[None, :]
         max_idx = TOTAL_TASK_PREDICATE_EMBEDDINGS - 1
         pred_indices = jnp.clip(pred_indices, 0, max_idx)
-        
-        # Get all embeddings [B, P, 1024]
-        all_embeddings = self.task_predicate_embeddings(pred_indices)
-        
-        # Create done and remaining masks
-        done_mask = predicate_states & predicate_mask  # [B, P]
-        remaining_mask = ~predicate_states & predicate_mask  # [B, P]
-        
-        # Mean pooling with masks
-        # Done embeddings
-        done_sum = jnp.sum(all_embeddings * done_mask[..., None], axis=1)  # [B, 1024]
-        num_done = jnp.maximum(jnp.sum(done_mask, axis=1, keepdims=True), 1.0)  # [B, 1]
-        done_agg = done_sum / num_done  # [B, 1024]
-        
-        # Remaining embeddings
-        remaining_sum = jnp.sum(all_embeddings * remaining_mask[..., None], axis=1)  # [B, 1024]
-        num_remaining = jnp.maximum(jnp.sum(remaining_mask, axis=1, keepdims=True), 1.0)  # [B, 1]
-        remaining_agg = remaining_sum / num_remaining  # [B, 1024]
+
+        all_embeddings = self.task_predicate_embeddings(pred_indices)  # [B, P, 1024]
+
+        # V2: Apply per-type modules if progress is available
+        if predicate_progress is not None:
+            progress = predicate_progress[..., None]  # [B, P, 1]
+            emb_with_progress = jnp.concatenate([all_embeddings, progress], axis=-1)  # [B, P, 1025]
+
+            # Forall module: MLP + residual
+            forall_out = nnx.relu(self.forall_fc1(emb_with_progress))
+            forall_out = self.forall_fc2(forall_out) + all_embeddings
+
+            # Exists module: MLP + residual
+            exists_out = nnx.relu(self.exists_fc1(emb_with_progress))
+            exists_out = self.exists_fc2(exists_out) + all_embeddings
+
+            # Use forall_out for quantified predicates (progress != binary state)
+            states_float = predicate_states.astype(jnp.float32)
+            is_quantified = jnp.abs(predicate_progress - states_float) > 0.01
+            all_embeddings = jnp.where(is_quantified[..., None], forall_out, all_embeddings)
+
+        done_mask = predicate_states & predicate_mask
+        remaining_mask = ~predicate_states & predicate_mask
+
+        done_sum = jnp.sum(all_embeddings * done_mask[..., None], axis=1)
+        num_done = jnp.maximum(jnp.sum(done_mask, axis=1, keepdims=True), 1.0)
+        done_agg = done_sum / num_done
+
+        remaining_sum = jnp.sum(all_embeddings * remaining_mask[..., None], axis=1)
+        num_remaining = jnp.maximum(jnp.sum(remaining_mask, axis=1, keepdims=True), 1.0)
+        remaining_agg = remaining_sum / num_remaining
         
         return done_agg, remaining_agg
 
@@ -480,34 +483,11 @@ class PiBehavior(_model.BaseModel):
         task_ids: at.Int[at.Array, " b"], 
         predicate_states: at.Bool[at.Array, "b p"],
         predicate_mask: at.Bool[at.Array, "b p"],
+        predicate_progress=None,
     ) -> at.Float[at.Array, "b n d"]:
-        """Fuse task embedding with predicate states using multiple representations.
-        
-        Uses multi-label predicates where each predicate indicates if an object is done.
-        All representations are fully task-specific - done_agg and remaining_agg come from
-        task-specific predicate embeddings, so "3 done" means different things for different tasks.
-        
-        Returns multiple vectors differently conditioned by predicate states:
-        1. Task-gated representation (task embedding modulated by predicates)
-        2. Balanced fusion (task + predicates combined)
-        3. Remaining-focus representation (what to manipulate next)
-        4. Done-focus representation (what to avoid)
-        
-        All output representations have dimension 2048 (task_embedding_dim).
-        
-        Args:
-            task_embedding: Base task embedding [b, 2048]
-            task_ids: Task IDs for task-specific predicate embeddings [b]
-            predicate_states: [B, P] True = object is done
-            predicate_mask: [B, P] True = predicate is valid for this task
-            
-        Returns:
-            Multiple fused embeddings [b, 4, 2048]
-        """
-        # Get task-specific predicate aggregations
-        # These are mean-pooled from task_predicate_embeddings, so fully task-specific
+        """Fuse task embedding with predicate states using multiple representations."""
         done_agg, remaining_agg = self.aggregate_predicate_embeddings(
-            task_ids, predicate_states, predicate_mask
+            task_ids, predicate_states, predicate_mask, predicate_progress
         )  # [b, 1024], [b, 1024]
         
         # Concatenate inputs for gating: task (2048) + done_agg (1024) + remaining_agg (1024) = 4096
@@ -599,8 +579,9 @@ class PiBehavior(_model.BaseModel):
             if obs.predicate_states is not None and obs.predicate_mask is not None:
                 # Use predicate-based fusion
                 fused_task_embeddings = self.fuse_task_and_predicates(
-                    base_task_embedding, task_ids, 
-                    obs.predicate_states, obs.predicate_mask
+                    base_task_embedding, task_ids,
+                    obs.predicate_states, obs.predicate_mask,
+                    getattr(obs, 'predicate_progress', None)
                 )
             else:
                 raise ValueError("predicate_states and predicate_mask must be provided for PI_BEHAVIOR model")
@@ -950,9 +931,21 @@ class PiBehavior(_model.BaseModel):
             losses["predicate_recall_done"] = jnp.mean(jnp.sum(pred_done.astype(jnp.float32), axis=-1) / num_gt_done)
             
             predicate_loss_value = self.config.predicate_loss_weight * jnp.mean(per_sample_loss)
-        
+
+        # V2: Progress regression loss (MSE on continuous predicates)
+        progress_loss_value = 0.0
+        if train and hasattr(observation, 'predicate_progress') and observation.predicate_progress is not None:
+            progress_pred = jax.nn.sigmoid(self.progress_pred_from_vlm(base_task_output))  # [B, 20]
+            progress_target = observation.predicate_progress.astype(jnp.float32)
+            progress_mse = jnp.square(progress_pred - progress_target) * pred_mask * valid_pred_mask.astype(jnp.float32)
+            num_valid_progress = jnp.maximum(jnp.sum(pred_mask * valid_pred_mask.astype(jnp.float32), axis=-1), 1.0)
+            per_sample_progress_loss = jnp.sum(progress_mse, axis=-1) / num_valid_progress
+            losses["progress_loss"] = jnp.mean(per_sample_progress_loss)
+            progress_loss_weight = getattr(self.config, 'progress_loss_weight', 0.05)
+            progress_loss_value = progress_loss_weight * losses["progress_loss"]
+
         # 13. Total loss
-        losses["total_loss"] = losses["action_loss"] + fast_loss_value + predicate_loss_value
+        losses["total_loss"] = losses["action_loss"] + fast_loss_value + predicate_loss_value + progress_loss_value
         
         return losses
 

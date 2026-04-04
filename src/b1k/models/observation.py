@@ -1,8 +1,7 @@
-"""Observation class and preprocessing with FAST auxiliary fields support.
+"""Observation class with progress fields for Exp 2.
 
-Based on openpi with FAST fields added for PI_BEHAVIOR model.
-
-Reference: https://github.com/wensi-ai/openpi/blob/behavior/src/openpi/models/model.py
+CHANGES from V1:
+- Added predicate_progress: [B, 20] float (continuous 0-1 progress values)
 """
 
 from collections.abc import Sequence
@@ -32,8 +31,8 @@ IMAGE_RESOLUTION = (224, 224)
 @at.typecheck
 @struct.dataclass
 class Observation(Generic[ArrayT]):
-    """Observation with FAST auxiliary fields."""
-    
+    """Observation with FAST auxiliary fields and predicate progress."""
+
     images: dict[str, at.Float[ArrayT, "*b h w c"]]
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     state: at.Float[ArrayT, "*b s"]
@@ -41,29 +40,30 @@ class Observation(Generic[ArrayT]):
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
-    
+
     fast_tokens: at.Int[ArrayT, "*b t"] | None = None
     fast_token_mask: at.Bool[ArrayT, "*b t"] | None = None
-    
+
     # Predicate-based conditioning (multi-label binary states)
-    # predicate_states: [B, MAX_NUM_PREDICATES] - True = object is done/at final position
-    # predicate_mask: [B, MAX_NUM_PREDICATES] - True = predicate is valid for this task
     predicate_states: at.Bool[ArrayT, "*b p"] | None = None
     predicate_mask: at.Bool[ArrayT, "*b p"] | None = None
+
+    # V2: Continuous progress values (0-1) for forall/exists predicates
+    predicate_progress: at.Float[ArrayT, "*b p"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """Convert dict to Observation."""
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        
+
         # Convert uint8 images to float32 [-1, 1]
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
-        
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -76,6 +76,7 @@ class Observation(Generic[ArrayT]):
             fast_token_mask=data.get("fast_token_mask"),
             predicate_states=data.get("predicate_states"),
             predicate_mask=data.get("predicate_mask"),
+            predicate_progress=data.get("predicate_progress"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -107,9 +108,7 @@ def preprocess_observation(
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
-            # Convert from [-1, 1] to [0, 1] for augmax
             image = image / 2.0 + 0.5
-
             transforms = []
             if "wrist" not in key:
                 height, width = image.shape[1:3]
@@ -123,13 +122,10 @@ def preprocess_observation(
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
-
-            # Back to [-1, 1]
             image = image * 2.0 - 1.0
 
         out_images[key] = image
 
-    # Obtain masks
     out_masks = {}
     for key in out_images:
         if key not in observation.image_masks:
@@ -149,5 +145,5 @@ def preprocess_observation(
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
         predicate_states=getattr(observation, 'predicate_states', None),
         predicate_mask=getattr(observation, 'predicate_mask', None),
+        predicate_progress=getattr(observation, 'predicate_progress', None),
     )
-

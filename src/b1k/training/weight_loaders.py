@@ -60,10 +60,14 @@ class PiBehaviorWeightLoader(WeightLoader):
         has_task_embeddings = 'task_embeddings' in loaded_params
         
         if has_task_embeddings:
-            # Loading PI_BEHAVIOR checkpoint - load ALL weights from checkpoint
-            logging.info("Loading PI_BEHAVIOR checkpoint (all weights will be loaded)")
-            # Use _merge_params with empty missing_regex to validate shapes
-            return _merge_params(loaded_params, params, missing_regex="^$")
+            # Loading PI_BEHAVIOR checkpoint — V2 new modules use random init
+            logging.info("Loading PI_BEHAVIOR checkpoint (V2 progress modules will use random init)")
+            missing_regex = (
+                ".*forall_fc.*|"
+                ".*exists_fc.*|"
+                ".*progress_pred_from_vlm.*"
+            )
+            return _merge_params(loaded_params, params, missing_regex=missing_regex)
         else:
             # Loading Pi05 checkpoint - preserve new PI_BEHAVIOR-specific parameters
             logging.info("Loading Pi05 checkpoint (new PI_BEHAVIOR parameters will use random init)")
