@@ -103,10 +103,16 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Implements approach from https://www.physicalintelligence.company/research/knowledge_insulation
     use_knowledge_insulation: bool = True
     
+    # Predicate encoder architecture: "v1" | "v2_progress" | "v2_deep_sets"
+    predicate_encoder_type: str = "v1"
+
     # Predicate prediction auxiliary loss weight (relative to action loss)
     # Uses BCE loss for multi-label binary classification
     predicate_loss_weight: float = 0.1
-    
+
+    # Progress regression loss weight (MSE on continuous predicates, for v2_progress and v2_deep_sets)
+    progress_loss_weight: float = 0.05
+
     # Path to predicate data directory containing state_action_vectors.pkl files
     predicate_data_path: str = "data/predicate_data"
     

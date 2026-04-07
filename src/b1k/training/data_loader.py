@@ -337,11 +337,14 @@ def create_local_h5_behavior_dataset(
     if data_config.local_parquet_root is None:
         raise ValueError("local_parquet_root must be set when use_local_h5=True")
 
+    # Use only tasks that have V2 predicate data
+    v2_tasks = [2, 3, 5, 6, 10, 11, 13, 14, 15, 19, 23, 24, 25, 28, 29, 34, 42, 44, 47, 48]
+
     dataset = create_local_h5_dataset(
         parquet_root=data_config.local_parquet_root,
         h5_root=data_config.local_h5_root,
         video_root=data_config.local_video_root,
-        tasks=None,  # All 50 tasks
+        tasks=v2_tasks,
         action_horizon=action_horizon,
         image_size=224,
         shuffle=True,

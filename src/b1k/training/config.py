@@ -89,8 +89,14 @@ class DataConfig:
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
 
-    # Episodes index to use for training 
+    # Episodes index to use for training
     episodes_index: List[int] | None = None
+
+    # Local H5 dataset (off by default; used on kumarlab02)
+    use_local_h5: bool = False
+    local_parquet_root: str | None = None
+    local_h5_root: str | None = None
+    local_video_root: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -350,38 +356,149 @@ _CONFIGS = [
             use_kv_transform=True,
             use_knowledge_insulation=False,
             freeze_vision_backbone=True,
-            predicate_data_path="/pool/yishao/v2_extract/predicate_data",  # V2 data; B200: /vast/projects/kumar/lab/yishao/data/predicate_data_v2
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2",  # V2 data (Betty local)
             predicate_loss_weight=0.1,
         ),
         data=LeRobotB1KDataConfig(
             repo_id="IliaLarchenko/behavior_224_rgb",
             base_config=DataConfig(
-                prompt_from_task=False,  # No text prompts for PI_BEHAVIOR
+                prompt_from_task=False,
                 behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
-                use_per_timestamp_norm=True,  # Enable per-timestamp normalization
-                # episodes_index=list(range(100)),  # First 100 episodes per task (faster loading)
+                use_per_timestamp_norm=True,
+                use_local_h5=True,
+                local_parquet_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb/data",
+                local_h5_root="/vast/projects/kumar/lab/yishao/VLA_DS/data/processed/frames_h5",
+                local_video_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb/videos",
             ),
             use_delta_joint_actions=True,
-            use_fast_tokenization=True,  # Enable FAST tokenization in data pipeline
+            use_fast_tokenization=True,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
+            warmup_steps=500,
             peak_lr=1e-5,
-            decay_steps=20_000,
-            decay_lr=1e-5,
+            decay_steps=10_000,
+            decay_lr=1e-6,
         ),
         num_flow_samples=15,
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            # "/vast/projects/kumar/lab/yishao/checkpoints_50/pi_behavior_b1k_fast/behavior_50t_checkpoint/1/params" # trained 50 task with stage
-            # "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params" # finetuned 20 tasks 
-            "gs://openpi-assets/checkpoints/pi05_base/params" # pi0 base weights
+            "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params"
         ),
-        num_train_steps=200_000,
+        num_train_steps=10_000,
         assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
         checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
-        num_workers=64, # for torch or grain total
-        save_interval=500,
-        keep_period=2000,
+        num_workers=64,
+        save_interval=1000,
+        keep_period=1000,
+    ),
+    # Exp2: V2 data + V2 progress encoder (V1 arch + forall/exists + progress loss)
+    TrainConfig(
+        name="pi_behavior_b1k_exp2",
+        exp_name="exp2_v2_progress",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            freeze_vision_backbone=True,
+            predicate_encoder_type="v2_progress",
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2",
+            predicate_loss_weight=0.1,
+            progress_loss_weight=0.05,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="IliaLarchenko/behavior_224_rgb",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
+                use_per_timestamp_norm=True,
+                use_local_h5=True,
+                local_parquet_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb/data",
+                local_h5_root="/vast/projects/kumar/lab/yishao/VLA_DS/data/processed/frames_h5",
+                local_video_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb/videos",
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-5,
+            decay_steps=10_000,
+            decay_lr=1e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params",
+            predicate_encoder_type="v2_progress",
+        ),
+        num_train_steps=10_000,
+        assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
+        checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
+        num_workers=64,
+        save_interval=1000,
+        keep_period=1000,
+    ),
+    # Exp3: V2 data + Deep Sets encoder (full V2 architecture)
+    TrainConfig(
+        name="pi_behavior_b1k_exp3",
+        exp_name="exp3_v2_deep_sets",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            freeze_vision_backbone=True,
+            predicate_encoder_type="v2_deep_sets",
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2",
+            predicate_loss_weight=0.1,
+            progress_loss_weight=0.05,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="IliaLarchenko/behavior_224_rgb",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb",
+                use_per_timestamp_norm=True,
+                use_local_h5=True,
+                local_parquet_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb/data",
+                local_h5_root="/vast/projects/kumar/lab/yishao/VLA_DS/data/processed/frames_h5",
+                local_video_root="/vast/projects/kumar/lab/yishao/data/behavior_224_rgb/videos",
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-5,
+            decay_steps=10_000,
+            decay_lr=1e-6,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/vast/projects/kumar/lab/yishao/checkpoints/checkpoint_1/params",
+            predicate_encoder_type="v2_deep_sets",
+        ),
+        num_train_steps=10_000,
+        assets_base_dir="/vast/projects/kumar/lab/yishao/b1k_2/outputs/assets_50",
+        checkpoint_base_dir="/vast/projects/kumar/lab/yishao/checkpoints_50",
+        num_workers=64,
+        save_interval=1000,
+        keep_period=1000,
     ),
 ]
 

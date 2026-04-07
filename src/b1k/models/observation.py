@@ -45,11 +45,14 @@ class Observation(Generic[ArrayT]):
     fast_tokens: at.Int[ArrayT, "*b t"] | None = None
     fast_token_mask: at.Bool[ArrayT, "*b t"] | None = None
     
-    # Predicate-based conditioning (multi-label binary states)
-    # predicate_states: [B, MAX_NUM_PREDICATES] - True = object is done/at final position
-    # predicate_mask: [B, MAX_NUM_PREDICATES] - True = predicate is valid for this task
+    # Predicate conditioning
     predicate_states: at.Bool[ArrayT, "*b p"] | None = None
     predicate_mask: at.Bool[ArrayT, "*b p"] | None = None
+    predicate_progress: at.Float[ArrayT, "*b p"] | None = None
+    # Deep Sets structured features (v2_deep_sets only)
+    predicate_name_ids: at.Int[ArrayT, "*b p"] | None = None
+    predicate_arg_ids: at.Int[ArrayT, "*b p"] | None = None
+    predicate_type_ids: at.Int[ArrayT, "*b p"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -76,6 +79,10 @@ class Observation(Generic[ArrayT]):
             fast_token_mask=data.get("fast_token_mask"),
             predicate_states=data.get("predicate_states"),
             predicate_mask=data.get("predicate_mask"),
+            predicate_progress=data.get("predicate_progress"),
+            predicate_name_ids=data.get("predicate_name_ids"),
+            predicate_arg_ids=data.get("predicate_arg_ids"),
+            predicate_type_ids=data.get("predicate_type_ids"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -149,5 +156,9 @@ def preprocess_observation(
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
         predicate_states=getattr(observation, 'predicate_states', None),
         predicate_mask=getattr(observation, 'predicate_mask', None),
+        predicate_progress=getattr(observation, 'predicate_progress', None),
+        predicate_name_ids=getattr(observation, 'predicate_name_ids', None),
+        predicate_arg_ids=getattr(observation, 'predicate_arg_ids', None),
+        predicate_type_ids=getattr(observation, 'predicate_type_ids', None),
     )
 

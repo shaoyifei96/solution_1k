@@ -482,19 +482,23 @@ def main(config: _config.TrainConfig):
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        # Prefetch next batch while GPU computes (JAX async dispatch).
+        # ptrain_step returns immediately because JAX is async; the GPU is still
+        # working. Calling next(data_iter) here lets the CPU dataloader prepare
+        # the next batch in parallel with GPU computation.
+        batch = next(data_iter)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            
+
             # Create a concise console log with main metrics
-            main_metrics = {k: v for k, v in reduced_info.items() 
+            main_metrics = {k: v for k, v in reduced_info.items()
                           if "loss" in k or "accuracy" in k or k in ["grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"]}
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in main_metrics.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
