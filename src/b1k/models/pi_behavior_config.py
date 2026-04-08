@@ -28,18 +28,32 @@ if TYPE_CHECKING:
 # PREDICATE-BASED CONDITIONING
 # ============================================================================
 # Per-task predicate counts (number of objects/items to track per task)
-# Each predicate = "this object is at its final location (done moving)"
-# Data from: data/predicate_data/state_vector_sizes_dict.pkl
+# V1 entries: from data/predicate_data/state_vector_sizes_dict.pkl (V1 hand-annotated pkl)
+# V2 entries: must match num_items in predicate_data_v2_fixed/task_XXXX_state_action_vectors.pkl
+#
+# History: V1 era values were correct relative to V1 pkl. When V2 BDDL extraction
+# was added, the V2 task entries below were left at their old V1 values, which
+# caused (a) embedding-row collisions across V2 tasks where pkl > config (e.g.
+# task 10 colliding with task 11, task 28 colliding with task 29 on 4 slots), and
+# (b) eval/train inconsistency where eval read N=config but training masked
+# M=pkl predicates. The 13 V2 task entries below have been updated to match the
+# V2 fixed pkl. A runtime assertion in PredicateDataStore._load_all_data catches
+# any future drift.
+#
+# Updated entries (2026-04-08, V2 fix):
+#   task  2: 6→4    task  5: 4→2    task  6: 4→2    task 10: 5→6
+#   task 11: 8→2    task 15: 3→1    task 19: 5→7    task 23: 7→1
+#   task 24: 8→4    task 28: 6→10   task 29: 10→8   task 42: 3→4    task 44: 5→8
 TASK_NUM_PREDICATES = (
-    1, 4, 6, 4, 6, 4, 4, 6, 3, 7,   # Tasks 0-9
-    5, 8, 6, 3, 3, 3, 2, 2, 3, 5,   # Tasks 10-19
-    15, 7, 4, 7, 8, 4, 20, 6, 6, 10,  # Tasks 20-29
+    1, 4, 4, 4, 6, 2, 2, 6, 3, 7,   # Tasks 0-9   (V2: 2,5,6 changed)
+    6, 2, 6, 3, 3, 1, 2, 2, 3, 7,   # Tasks 10-19 (V2: 10,11,15,19 changed)
+    15, 7, 4, 1, 4, 4, 20, 6, 10, 8,  # Tasks 20-29 (V2: 23,24,28,29 changed)
     4, 2, 2, 4, 1, 1, 1, 1, 1, 1,   # Tasks 30-39
-    1, 5, 3, 6, 5, 2, 2, 4, 7, 8,   # Tasks 40-49
+    1, 5, 4, 6, 8, 2, 2, 4, 7, 8,   # Tasks 40-49 (V2: 42,44 changed)
 )
 
 MAX_NUM_PREDICATES = 20  # Maximum predicates per task (task 26 has 20)
-TOTAL_TASK_PREDICATE_EMBEDDINGS = sum(TASK_NUM_PREDICATES)  # 233 total embeddings
+TOTAL_TASK_PREDICATE_EMBEDDINGS = sum(TASK_NUM_PREDICATES)  # 218 total embeddings (was 233)
 
 # Cumulative offsets for indexing into task_predicate_embeddings
 TASK_PREDICATE_OFFSETS = tuple([0] + [sum(TASK_NUM_PREDICATES[:i+1]) for i in range(len(TASK_NUM_PREDICATES) - 1)])

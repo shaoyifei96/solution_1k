@@ -66,6 +66,28 @@ class PredicateDataStore:
                     logger.warning(f"Invalid data structure in {filename}, skipping")
                     continue
 
+                # Validate that pkl num_items matches the hardcoded TASK_NUM_PREDICATES.
+                # If they drift apart, the model embedding-table offsets become wrong:
+                # - pkl > config: predicate slots overflow into the next task's
+                #   reserved embedding rows, causing cross-task collision (real
+                #   training conflict if both tasks are in the training set, or
+                #   silent borrowing of unused V1 rows otherwise)
+                # - pkl < config: harmless wasted rows, but still indicates the
+                #   config is stale relative to the data
+                # Either way, fail loud at load time rather than silently train
+                # on a misconfigured model.
+                from b1k.models.pi_behavior_config import TASK_NUM_PREDICATES
+                expected = TASK_NUM_PREDICATES[task_id]
+                actual = task_data['num_items']
+                if actual != expected:
+                    raise ValueError(
+                        f"Predicate count mismatch for task {task_id} ({filename}): "
+                        f"pkl has num_items={actual} but TASK_NUM_PREDICATES[{task_id}]={expected}. "
+                        f"This causes embedding-row collisions across tasks. Fix by either:\n"
+                        f"  (a) updating TASK_NUM_PREDICATES[{task_id}] to {actual} in pi_behavior_config.py, or\n"
+                        f"  (b) re-extracting this task's pkl with BDDL goals matching {expected} predicates."
+                    )
+
                 self.task_data[task_id] = task_data
                 self.max_num_predicates = max(self.max_num_predicates, task_data['num_items'])
             else:
