@@ -42,6 +42,16 @@ class B1KWrapperConfig:
     predicate_votes_to_done: int = 2  # Votes needed to transition predicate 0→1
     predicate_allow_backward: bool = True  # Allow predicates to go back 1→0
     predicate_votes_to_undo: int = 3  # Votes needed to transition predicate 1→0 (if allowed)
+
+    # Optional V2 predicate data path. If provided, the wrapper preloads
+    # per-task Deep Sets metadata (name/arg/type ids) so exp3 has structured
+    # input even though the online state only carries (states, mask, progress).
+    predicate_metadata_path: str | None = None
+
+    # Ablation: zero out the entire predicate input channel before sending to
+    # the model. Used to test whether the model actually uses predicates at
+    # eval time, or has learned to ignore them due to corrupted training data.
+    ablation_zero_predicates: bool = False
     
     # Predicate logging settings (for evaluation analysis)
     log_predicates: bool = False  # Enable predicate logging
@@ -103,6 +113,24 @@ class B1KPolicyWrapper():
         # Predicate logging data structure
         self.predicate_log: List[Dict] = []  # Accumulated predicate history
         self._log_start_time = time.time()
+
+        # Optional V2 metadata store (for exp3 Deep Sets encoder).
+        # Online predicate state from the env only carries (states, mask, progress);
+        # the structured (name_ids, arg_ids, type_ids) per task are static and loaded once here.
+        self._metadata_store = None
+        self._metadata_cache: Dict[int, tuple] = {}
+        if self.config.predicate_metadata_path:
+            try:
+                from b1k.shared.predicate_data import PredicateDataStore
+                self._metadata_store = PredicateDataStore(self.config.predicate_metadata_path)
+                logger.info(
+                    f"Loaded V2 predicate metadata store from {self.config.predicate_metadata_path}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load predicate_metadata_path={self.config.predicate_metadata_path}: {e}"
+                )
+                self._metadata_store = None
     
     def reset(self):
         """Reset policy state."""
@@ -358,13 +386,18 @@ class B1KPolicyWrapper():
         left_resized = resize_with_pad(left_original, RESIZE_SIZE, RESIZE_SIZE)
         right_resized = resize_with_pad(right_original, RESIZE_SIZE, RESIZE_SIZE)
         
-        return {
+        out = {
             "observation/egocentric_camera": head_resized,
             "observation/wrist_image_left": left_resized,
             "observation/wrist_image_right": right_resized,
             "observation/state": prop_state,
             "prompt": self.text_prompt,
         }
+        # Forward online ground-truth predicate state if the eval-side env attached it.
+        for k in ("predicate_states_online", "predicate_mask_online", "predicate_progress_online"):
+            if k in obs:
+                out[k] = obs[k]
+        return out
     
     def update_predicate_states(self, predicate_logits):
         """Update predicate states using per-predicate consensus voting.
@@ -431,19 +464,61 @@ class B1KPolicyWrapper():
         batch_copy = batch.copy()
         if "prompt" in batch_copy:
             del batch_copy["prompt"]
-        
+
         # Task ID only (no stage - predicates are the state now)
         batch_copy["tokenized_prompt"] = np.array([task_id], dtype=np.int32)
         batch_copy["tokenized_prompt_mask"] = np.array([True], dtype=bool)
-        
+
         # Add predicate states for predicate-based conditioning
         num_predicates = TASK_NUM_PREDICATES[task_id] if task_id >= 0 else 1
         predicate_mask = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
         predicate_mask[:num_predicates] = True
-        
-        batch_copy["predicate_states"] = self.current_predicate_states.copy()
-        batch_copy["predicate_mask"] = predicate_mask
-        
+
+        # Prefer ground-truth online predicate state from the eval-side BDDL
+        # evaluator (matches training distribution: continuous progress for
+        # forall/exists). Fall back to the model's self-predicted consensus.
+        online_states = batch.get("predicate_states_online")
+        if online_states is not None:
+            batch_copy["predicate_states"] = np.asarray(online_states, dtype=bool)
+            online_mask = batch.get("predicate_mask_online")
+            if online_mask is not None:
+                batch_copy["predicate_mask"] = np.asarray(online_mask, dtype=bool)
+            else:
+                batch_copy["predicate_mask"] = predicate_mask
+            online_progress = batch.get("predicate_progress_online")
+            if online_progress is not None:
+                batch_copy["predicate_progress"] = np.asarray(online_progress, dtype=np.float32)
+            # Drop the wire-format keys so we don't ship them into the policy.
+            for k in ("predicate_states_online", "predicate_mask_online", "predicate_progress_online"):
+                batch_copy.pop(k, None)
+        else:
+            batch_copy["predicate_states"] = self.current_predicate_states.copy()
+            batch_copy["predicate_mask"] = predicate_mask
+
+        # Ablation: nuke the entire predicate input channel.
+        if self.config.ablation_zero_predicates:
+            batch_copy["predicate_states"] = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+            batch_copy["predicate_mask"] = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+            batch_copy["predicate_progress"] = np.zeros(MAX_NUM_PREDICATES, dtype=np.float32)
+
+        # Attach Deep Sets metadata for exp3 (static per task; loaded from V2 pkl).
+        if self._metadata_store is not None and task_id >= 0:
+            meta = self._metadata_cache.get(task_id)
+            if meta is None:
+                try:
+                    meta = self._metadata_store.get_predicate_metadata(
+                        task_id, max_predicates=MAX_NUM_PREDICATES
+                    )
+                    self._metadata_cache[task_id] = meta
+                except Exception as e:
+                    logger.warning(f"Failed to fetch predicate metadata for task {task_id}: {e}")
+                    meta = None
+            if meta is not None:
+                name_ids, arg_ids, type_ids = meta
+                batch_copy["predicate_name_ids"] = name_ids
+                batch_copy["predicate_arg_ids"] = arg_ids
+                batch_copy["predicate_type_ids"] = type_ids
+
         return batch_copy
     
     def _interpolate_actions(self, actions, target_steps):

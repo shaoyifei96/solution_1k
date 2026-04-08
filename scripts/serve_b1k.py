@@ -88,6 +88,13 @@ class Args:
     predicate_log_dir: str = "predicate_logs"  # Directory to save predicate logs
     predicate_log_prefix: str = ""  # Prefix for log file names (e.g., task name or run ID)
 
+    # Optional V2 predicate pkl directory. If set, the wrapper preloads
+    # per-task Deep Sets metadata (name/arg/type ids) for exp3.
+    predicate_metadata_path: str | None = None
+
+    # Ablation: zero out predicate input to test if model actually uses it.
+    ablation_zero_predicates: bool = False
+
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
@@ -157,6 +164,8 @@ def main(args: Args) -> None:
         log_predicates=args.log_predicates,
         predicate_log_dir=args.predicate_log_dir,
         predicate_log_prefix=args.predicate_log_prefix,
+        predicate_metadata_path=args.predicate_metadata_path,
+        ablation_zero_predicates=args.ablation_zero_predicates,
     )
     
     logging.info(f"Wrapper config: execute={wrapper_config.actions_to_execute}, keep={wrapper_config.actions_to_keep}, steps={wrapper_config.execute_in_n_steps}, num_steps={wrapper_config.num_steps}")

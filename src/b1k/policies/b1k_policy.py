@@ -137,6 +137,16 @@ class B1kInputs(transforms.DataTransformFn):
             inputs["predicate_states"] = data["predicate_states"]
         if "predicate_mask" in data:
             inputs["predicate_mask"] = data["predicate_mask"]
+        # Continuous progress for v2_progress / v2_deep_sets encoders
+        if "predicate_progress" in data:
+            inputs["predicate_progress"] = data["predicate_progress"]
+        # Deep Sets structured features (v2_deep_sets only)
+        if "predicate_name_ids" in data:
+            inputs["predicate_name_ids"] = data["predicate_name_ids"]
+        if "predicate_arg_ids" in data:
+            inputs["predicate_arg_ids"] = data["predicate_arg_ids"]
+        if "predicate_type_ids" in data:
+            inputs["predicate_type_ids"] = data["predicate_type_ids"]
 
         return inputs
 
