@@ -409,7 +409,9 @@ _CONFIGS = [
             use_knowledge_insulation=False,
             freeze_vision_backbone=True,
             predicate_encoder_type="v2_progress",
-            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2",
+            # Fixed predicate pkl with correct sim-step indexing.
+            # Original (broken) path: /vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2_fixed",
             predicate_loss_weight=0.1,
             progress_loss_weight=0.05,
         ),
