@@ -137,6 +137,19 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Vision backbone finetuning control
     freeze_vision_backbone: bool = True
 
+    # Scheduled sampling: corrupt predicates during training to close train-eval gap
+    # With prob gt_ratio, use GT predicates; with prob (1-gt_ratio), corrupt them
+    use_scheduled_sampling: bool = False
+    ss_gt_ratio_start: float = 1.0   # Initial fraction using GT predicates
+    ss_gt_ratio_end: float = 0.5     # Final fraction using GT predicates
+    ss_warmup_steps: int = 500        # Pure GT during warmup (no corruption)
+    ss_decay_steps: int = 15000       # Linear decay from start to end over this many steps
+    ss_mode: str = "zero"             # "zero": zero-out all preds for non-GT samples
+                                      # "flip": randomly flip 30% of preds for non-GT samples
+
+    # Per-predicate dropout (independent of scheduled sampling, applied to ALL samples)
+    predicate_dropout_rate: float = 0.0
+
     def __post_init__(self):
         if self.task_embedding_dim is None:
             paligemma_config = _gemma.get_config(self.paligemma_variant)

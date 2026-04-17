@@ -793,13 +793,71 @@ class PiBehavior(_model.BaseModel):
         """Not used - we only use compute_detailed_loss() for training."""
         raise NotImplementedError("Use compute_detailed_loss() instead")
 
+    def _apply_scheduled_sampling(self, rng, observation, step):
+        """Corrupt predicates during training to close the teacher forcing gap.
+
+        Returns a new Observation with modified predicate_states/predicate_progress.
+        The original observation should be kept for loss computation (GT targets).
+        """
+        cfg = self.config
+        B = observation.state.shape[0]
+
+        if observation.predicate_states is None:
+            return observation, cfg.ss_gt_ratio_start
+
+        P = observation.predicate_states.shape[-1]
+        ss_rng, dropout_rng = jax.random.split(rng)
+
+        # Linear schedule: gt_ratio decays from start to end after warmup
+        step_f = jnp.float32(step)
+        gt_ratio = jnp.where(
+            step_f < cfg.ss_warmup_steps,
+            cfg.ss_gt_ratio_start,
+            cfg.ss_gt_ratio_start - (cfg.ss_gt_ratio_start - cfg.ss_gt_ratio_end) *
+                jnp.minimum(
+                    (step_f - cfg.ss_warmup_steps) / jnp.maximum(cfg.ss_decay_steps - cfg.ss_warmup_steps, 1.0),
+                    1.0
+                )
+        )
+
+        # Per-sample Bernoulli: decide GT or corrupted
+        use_gt = jax.random.bernoulli(ss_rng, gt_ratio, shape=(B, 1))  # bool [B, 1]
+
+        if cfg.ss_mode == "flip":
+            flip_rng = jax.random.fold_in(ss_rng, 1)
+            flip_mask = jax.random.bernoulli(flip_rng, 0.3, shape=(B, P))
+            corrupted = jnp.logical_xor(observation.predicate_states, flip_mask)
+            new_states = jnp.where(use_gt, observation.predicate_states, corrupted)
+        else:  # "zero" mode: zero out all predicates for non-GT samples
+            new_states = observation.predicate_states & use_gt
+
+        new_progress = observation.predicate_progress
+        if new_progress is not None:
+            new_progress = new_progress * use_gt.astype(jnp.float32)
+
+        # Per-predicate dropout (applied to ALL samples including GT ones)
+        if cfg.predicate_dropout_rate > 0:
+            keep = jax.random.bernoulli(dropout_rng, 1.0 - cfg.predicate_dropout_rate, shape=(B, P))
+            new_states = new_states & keep
+            if new_progress is not None:
+                new_progress = new_progress * keep.astype(jnp.float32)
+
+        # Use replace() to copy ALL fields, only overriding the corrupted ones.
+        # This prevents the Bug #2 class of errors (whitelist silently dropping fields)
+        # if new fields are added to Observation later.
+        new_obs = observation.replace(
+            predicate_states=new_states,
+            predicate_progress=new_progress,
+        )
+        return new_obs, gt_ratio
+
     @override
     def compute_detailed_loss(
-        self, rng: at.KeyArrayLike, observation: Observation, actions: _model.Actions, *, train: bool = False, num_flow_samples: int = 1
+        self, rng: at.KeyArrayLike, observation: Observation, actions: _model.Actions, *, train: bool = False, num_flow_samples: int = 1, step: int | None = None
     ) -> dict[str, at.Float[at.Array, "*b"]]:
         """
         Compute detailed loss with multiple flow matching samples.
-        
+
         Simplified approach using KV cache:
         - Compute prefix KV cache once (with FAST tokens)
         - Remove FAST tokens from cache (action expert doesn't attend to FAST)
@@ -812,9 +870,20 @@ class PiBehavior(_model.BaseModel):
         preprocess_rng, rng = jax.random.split(rng)
         observation = preprocess_observation(preprocess_rng, observation, train=train)
 
+        # Save original GT for loss computation before any corruption
+        gt_observation = observation
+
+        # Scheduled sampling: corrupt predicates for conditioning (embed_prefix)
+        # but keep GT for predicate/progress loss targets
+        gt_ratio_value = 1.0
+        if train and self.config.use_scheduled_sampling and step is not None:
+            ss_rng, rng = jax.random.split(rng)
+            observation, gt_ratio_value = self._apply_scheduled_sampling(ss_rng, observation, step)
+            losses["ss_gt_ratio"] = gt_ratio_value
+
         batch_size = actions.shape[0]
-        
-        # 1. Embed prefix once (includes FAST tokens if provided in observation)
+
+        # 1. Embed prefix once (uses potentially corrupted predicates)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         
         # 2. Compute prefix KV cache
@@ -1000,46 +1069,49 @@ class PiBehavior(_model.BaseModel):
         losses["action_loss"] = jnp.mean(action_loss, axis=(-2, -1))
 
         # 12. Add predicate loss during training (multi-label BCE)
+        # IMPORTANT: Use gt_observation (original GT) for loss targets, NOT the
+        # potentially corrupted observation from scheduled sampling.
         predicate_loss_value = 0.0
-        if train and observation.predicate_states is not None and observation.predicate_mask is not None:
+        if train and gt_observation.predicate_states is not None and gt_observation.predicate_mask is not None:
             # BCE loss: -[y*log(σ(x)) + (1-y)*log(1-σ(x))]
             # Using log_sigmoid for numerical stability
-            gt_predicates = observation.predicate_states.astype(jnp.float32)  # [B, P]
-            pred_mask = observation.predicate_mask.astype(jnp.float32)  # [B, P]
-            
+            gt_predicates = gt_observation.predicate_states.astype(jnp.float32)  # [B, P]
+            pred_mask = gt_observation.predicate_mask.astype(jnp.float32)  # [B, P]
+
             # Binary cross entropy per predicate
             # log(σ(x)) = -softplus(-x), log(1-σ(x)) = -softplus(x)
             pos_loss = -jax.nn.log_sigmoid(predicate_logits)  # Loss when y=1
             neg_loss = -jax.nn.log_sigmoid(-predicate_logits)  # Loss when y=0 (i.e., log(1-sigmoid))
             bce_loss = gt_predicates * pos_loss + (1.0 - gt_predicates) * neg_loss  # [B, P]
-            
+
             # Apply mask and compute mean over valid predicates
             masked_bce = bce_loss * pred_mask * valid_pred_mask.astype(jnp.float32)  # [B, P]
             num_valid = jnp.maximum(jnp.sum(pred_mask * valid_pred_mask.astype(jnp.float32), axis=-1), 1.0)  # [B]
             per_sample_loss = jnp.sum(masked_bce, axis=-1) / num_valid  # [B]
-            
+
             losses["predicate_loss"] = jnp.mean(per_sample_loss)
-            
+
             # Compute accuracy (threshold at 0.5, i.e., logits > 0)
             pred_binary = predicate_logits > 0  # [B, P]
-            correct = (pred_binary == observation.predicate_states) * observation.predicate_mask * valid_pred_mask
+            correct = (pred_binary == gt_observation.predicate_states) * gt_observation.predicate_mask * valid_pred_mask
             num_correct = jnp.sum(correct.astype(jnp.float32), axis=-1)
             losses["predicate_accuracy"] = jnp.mean(num_correct / num_valid)
             
             # Also track per-predicate-type accuracy
-            pred_done = (pred_binary & observation.predicate_states) * observation.predicate_mask * valid_pred_mask
-            gt_done = observation.predicate_states * observation.predicate_mask * valid_pred_mask
+            pred_done = (pred_binary & gt_observation.predicate_states) * gt_observation.predicate_mask * valid_pred_mask
+            gt_done = gt_observation.predicate_states * gt_observation.predicate_mask * valid_pred_mask
             num_gt_done = jnp.maximum(jnp.sum(gt_done.astype(jnp.float32), axis=-1), 1.0)
             losses["predicate_recall_done"] = jnp.mean(jnp.sum(pred_done.astype(jnp.float32), axis=-1) / num_gt_done)
-            
+
             predicate_loss_value = self.config.predicate_loss_weight * jnp.mean(per_sample_loss)
 
         # V2: Progress regression loss (MSE on continuous predicates)
+        # Use gt_observation for targets
         progress_loss_value = 0.0
         if train and self.config.predicate_encoder_type in ("v2_progress", "v2_deep_sets"):
-            if hasattr(observation, 'predicate_progress') and observation.predicate_progress is not None:
+            if hasattr(gt_observation, 'predicate_progress') and gt_observation.predicate_progress is not None:
                 progress_pred = jax.nn.sigmoid(self.progress_pred_from_vlm(base_task_output))  # [B, 20]
-                progress_target = observation.predicate_progress.astype(jnp.float32)
+                progress_target = gt_observation.predicate_progress.astype(jnp.float32)
                 progress_mse = jnp.square(progress_pred - progress_target) * pred_mask * valid_pred_mask.astype(jnp.float32)
                 num_valid_progress = jnp.maximum(jnp.sum(pred_mask * valid_pred_mask.astype(jnp.float32), axis=-1), 1.0)
                 per_sample_progress_loss = jnp.sum(progress_mse, axis=-1) / num_valid_progress

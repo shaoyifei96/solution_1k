@@ -281,11 +281,11 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck  
+    @at.typecheck
     def loss_fn(
         model: PiBehavior, rng: at.KeyArrayLike, observation: Observation, actions: _model.Actions
     ):
-        losses_dict = model.compute_detailed_loss(rng, observation, actions, train=True, num_flow_samples=config.num_flow_samples)
+        losses_dict = model.compute_detailed_loss(rng, observation, actions, train=True, num_flow_samples=config.num_flow_samples, step=state.step)
         total_loss = jnp.mean(losses_dict["total_loss"])
         return total_loss, losses_dict
 
