@@ -53,7 +53,7 @@ TASK_NUM_PREDICATES = (
 )
 
 MAX_NUM_PREDICATES = 20  # Maximum predicates per task (task 26 has 20)
-TOTAL_TASK_PREDICATE_EMBEDDINGS = sum(TASK_NUM_PREDICATES)  # 218 total embeddings (was 233)
+TOTAL_TASK_PREDICATE_EMBEDDINGS = sum(TASK_NUM_PREDICATES)  # 218 total embeddings
 
 # Cumulative offsets for indexing into task_predicate_embeddings
 TASK_PREDICATE_OFFSETS = tuple([0] + [sum(TASK_NUM_PREDICATES[:i+1]) for i in range(len(TASK_NUM_PREDICATES) - 1)])

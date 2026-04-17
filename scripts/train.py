@@ -429,9 +429,44 @@ def main(config: _config.TrainConfig):
     # prefetch_buffer_size=2,
     # )
 
+    # Eager-load PredicateDataStore in the main process BEFORE the data loader
+    # forks workers, so the per-task ALIGNED log fires in the main process
+    # logger (workers filter INFO and would otherwise hide it).
+    from b1k.shared.predicate_data import get_predicate_store
+    get_predicate_store(config.model.predicate_data_path)
+
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    # === Predicate alignment sanity check (positive confirmation that
+    # B1kInputs whitelist + transform + pkl are all wired correctly).
+    # If any of these fields are missing, all-zero, or shape-wrong, you'll see
+    # it here BEFORE wasting a 7k-step retrain on broken pipe inputs. ===
+    obs0 = batch[0]
+    _pred_present = {
+        "predicate_states": getattr(obs0, "predicate_states", None),
+        "predicate_mask": getattr(obs0, "predicate_mask", None),
+        "predicate_progress": getattr(obs0, "predicate_progress", None),
+        "predicate_name_ids": getattr(obs0, "predicate_name_ids", None),
+        "predicate_arg_ids": getattr(obs0, "predicate_arg_ids", None),
+        "predicate_type_ids": getattr(obs0, "predicate_type_ids", None),
+    }
+    for _k, _v in _pred_present.items():
+        if _v is None:
+            logging.warning(f"PREDICATE SANITY: {_k} = None (NOT in observation!)")
+            continue
+        _arr = np.asarray(_v)
+        _stats = (
+            f"shape={_arr.shape} dtype={_arr.dtype} "
+            f"min={float(_arr.min()):.4f} max={float(_arr.max()):.4f} "
+            f"mean={float(_arr.mean()):.4f} nonzero_frac={float((_arr != 0).mean()):.4f}"
+        )
+        logging.info(f"PREDICATE SANITY: {_k:22s} {_stats}")
+    logging.info(
+        f"PREDICATE SANITY: encoder_type={config.model.predicate_encoder_type!r} "
+        f"predicate_data_path={config.model.predicate_data_path}"
+    )
 
     # Log images from first batch to sanity check.
     images_to_log = [

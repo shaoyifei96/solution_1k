@@ -160,6 +160,8 @@ class B1kOutputs(transforms.DataTransformFn):
         # Preserve predicate logits for predicate-based models
         if "predicate_logits" in data:
             result["predicate_logits"] = data["predicate_logits"]
+        if "progress_pred" in data:
+            result["progress_pred"] = data["progress_pred"]
         
         # Preserve subtask prediction fields for backward compatibility / stage-based models
         if "subtask_logits" in data:

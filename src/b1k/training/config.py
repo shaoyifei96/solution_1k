@@ -356,7 +356,7 @@ _CONFIGS = [
             use_kv_transform=True,
             use_knowledge_insulation=False,
             freeze_vision_backbone=True,
-            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2",  # V2 data (Betty local)
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2_smoothed",  # V2 smoothed (median k5 + hold20)
             predicate_loss_weight=0.1,
         ),
         data=LeRobotB1KDataConfig(
@@ -411,7 +411,7 @@ _CONFIGS = [
             predicate_encoder_type="v2_progress",
             # Fixed predicate pkl with correct sim-step indexing.
             # Original (broken) path: /vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2
-            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2_fixed",
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2_smoothed",
             predicate_loss_weight=0.1,
             progress_loss_weight=0.05,
         ),
@@ -466,7 +466,7 @@ _CONFIGS = [
             use_knowledge_insulation=False,
             freeze_vision_backbone=True,
             predicate_encoder_type="v2_deep_sets",
-            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2_fixed",
+            predicate_data_path="/vast/projects/kumar/lab/yishao/b1k_2/data/predicate_data_v2_smoothed",
             predicate_loss_weight=0.1,
             progress_loss_weight=0.05,
         ),

@@ -148,6 +148,14 @@ class PiBehavior(_model.BaseModel):
         self.predicate_encoding_dim = config.task_embedding_dim // 2  # 1024
 
         encoder_type = config.predicate_encoder_type
+        import logging as _logging
+        _logging.info(
+            f"PiBehavior: predicate_encoder_type={encoder_type!r} | "
+            f"TOTAL_TASK_PREDICATE_EMBEDDINGS={TOTAL_TASK_PREDICATE_EMBEDDINGS} | "
+            f"MAX_NUM_PREDICATES={MAX_NUM_PREDICATES} | "
+            f"predicate_loss_weight={config.predicate_loss_weight} | "
+            f"progress_loss_weight={config.progress_loss_weight}"
+        )
 
         if encoder_type in ("v1", "v2_progress"):
             # V1 / V2-progress: task-specific predicate embeddings + gated fusion
@@ -171,6 +179,7 @@ class PiBehavior(_model.BaseModel):
             self.exists_fc1 = nnx.Linear(self.predicate_encoding_dim + 1, self.predicate_encoding_dim, rngs=rngs)
             self.exists_fc2 = nnx.Linear(self.predicate_encoding_dim, self.predicate_encoding_dim, rngs=rngs)
             self.progress_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_PREDICATES, rngs=rngs)
+            _logging.info(f"PiBehavior: created v2 progress-aware modules (forall_fc1/2, exists_fc1/2, progress_pred_from_vlm)")
 
         if encoder_type == "v2_deep_sets":
             # Deep Sets: shared predicate feature embeddings
@@ -186,6 +195,7 @@ class PiBehavior(_model.BaseModel):
             self.rho_fc2 = nnx.Linear(self.predicate_encoding_dim, config.task_embedding_dim, rngs=rngs)
             # Project to 4 task tokens
             self.pred_token_proj = nnx.Linear(config.task_embedding_dim, config.task_embedding_dim * 4, rngs=rngs)
+            _logging.info(f"PiBehavior: created v2_deep_sets modules (pred_type/name/arg_emb, phi_fc1/2, rho_fc1/2, pred_token_proj)")
         
         # Pi05 style layers
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
@@ -1254,5 +1264,12 @@ class PiBehavior(_model.BaseModel):
         pred_range = jnp.arange(MAX_NUM_PREDICATES)  # [20]
         valid_pred_mask = pred_range[None, :] < task_num_preds[:, None]  # [B, 20]
         predicate_logits = jnp.where(valid_pred_mask, predicate_logits, -jnp.inf)
-        
+
+        # Also return calibrated progress prediction from the MSE-trained head
+        # (only exists for v2_progress and v2_deep_sets encoders)
+        if hasattr(self, 'progress_pred_from_vlm'):
+            progress_pred = jax.nn.sigmoid(self.progress_pred_from_vlm(base_task_output))
+            progress_pred = jnp.where(valid_pred_mask, progress_pred, 0.0)
+            return x_0, predicate_logits, progress_pred
+
         return x_0, predicate_logits

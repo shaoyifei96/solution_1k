@@ -95,9 +95,16 @@ class PiBehaviorPolicy(Policy):
         start_time = time.monotonic()
         
         # ONLY DIFFERENCE: Unpack tuple return from PiBehavior.sample_actions
-        # Returns (actions, predicate_logits) where predicate_logits is [B, MAX_NUM_PREDICATES]
-        actions, predicate_logits = self._sample_actions(sample_rng, observation, **sample_kwargs)
-        
+        # Returns (actions, predicate_logits, progress_pred) where:
+        #   predicate_logits: [B, MAX_NUM_PREDICATES] binary head logits
+        #   progress_pred: [B, MAX_NUM_PREDICATES] calibrated continuous progress from MSE head
+        sample_result = self._sample_actions(sample_rng, observation, **sample_kwargs)
+        if len(sample_result) == 3:
+            actions, predicate_logits, progress_pred = sample_result
+        else:
+            actions, predicate_logits = sample_result
+            progress_pred = None
+
         outputs = {
             "state": inputs["state"],
             "actions": actions,  # Now an array, not a tuple!
@@ -105,6 +112,8 @@ class PiBehaviorPolicy(Policy):
             # Keep subtask_logits for backward compatibility (same as predicate_logits)
             "subtask_logits": predicate_logits,
         }
+        if progress_pred is not None:
+            outputs["progress_pred"] = progress_pred
         
         model_time = time.monotonic() - start_time
         

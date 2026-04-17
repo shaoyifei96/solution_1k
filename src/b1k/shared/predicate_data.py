@@ -90,11 +90,20 @@ class PredicateDataStore:
 
                 self.task_data[task_id] = task_data
                 self.max_num_predicates = max(self.max_num_predicates, task_data['num_items'])
+                n_eps = len(task_data['demo_vectors'])
+                logger.info(
+                    f"PredicateDataStore: task {task_id:2d} ALIGNED  pkl_num_items={actual} "
+                    f"cfg_num_items={expected}  n_episodes={n_eps}  ({filename})"
+                )
             else:
                 logger.warning(f"Missing predicate data for task {task_id}: {filepath}")
 
         if len(self.task_data) == 0:
             raise RuntimeError(f"No predicate data files found in {self.data_path}")
+        logger.info(
+            f"PredicateDataStore: ALL {len(self.task_data)} tasks aligned with TASK_NUM_PREDICATES "
+            f"(sum of loaded num_items = {sum(d['num_items'] for d in self.task_data.values())})"
+        )
 
     def _find_episode(self, demo_vectors: dict, task_id: int, episode_id: int) -> Optional[str]:
         """Find episode key in demo_vectors by trying multiple formats."""

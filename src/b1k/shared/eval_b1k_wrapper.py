@@ -93,6 +93,8 @@ class B1KPolicyWrapper():
         # Predicate consensus state
         # current_predicate_states: [MAX_NUM_PREDICATES] bool array, True = object is done
         self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+        # current_predicate_progress: [MAX_NUM_PREDICATES] float32, continuous 0-1 from sigmoid(logits)
+        self.current_predicate_progress = np.zeros(MAX_NUM_PREDICATES, dtype=np.float32)
         # Per-predicate prediction history: list of deques, one per predicate
         self.predicate_prediction_history = [
             deque([], maxlen=self.config.predicate_history_len)
@@ -146,6 +148,7 @@ class B1KPolicyWrapper():
         self.next_initial_actions = None
         # Reset predicate consensus state
         self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+        self.current_predicate_progress = np.zeros(MAX_NUM_PREDICATES, dtype=np.float32)
         for hist in self.predicate_prediction_history:
             hist.clear()
         # Reset predicate logging
@@ -367,6 +370,7 @@ class B1KPolicyWrapper():
             
             # Reset predicate consensus state on task change
             self.current_predicate_states = np.zeros(MAX_NUM_PREDICATES, dtype=bool)
+            self.current_predicate_progress = np.zeros(MAX_NUM_PREDICATES, dtype=np.float32)
             for hist in self.predicate_prediction_history:
                 hist.clear()
             self.last_actions = None
@@ -488,12 +492,24 @@ class B1KPolicyWrapper():
             online_progress = batch.get("predicate_progress_online")
             if online_progress is not None:
                 batch_copy["predicate_progress"] = np.asarray(online_progress, dtype=np.float32)
+            # Log oracle values: first 10, then every 50th, and whenever progress changes
+            prog = batch_copy.get("predicate_progress", np.zeros(1))
+            states = batch_copy["predicate_states"]
+            prog_summary = np.round(prog[:num_predicates], 2)
+            if self.prediction_count < 10 or self.prediction_count % 50 == 0:
+                logger.info(f"[ORACLE] pred#{self.prediction_count} states={states[:num_predicates]} progress={prog_summary}")
+            elif not hasattr(self, '_last_oracle_progress') or not np.array_equal(prog_summary, self._last_oracle_progress):
+                logger.info(f"[ORACLE CHANGED] pred#{self.prediction_count} progress={prog_summary}")
+            self._last_oracle_progress = prog_summary.copy()
             # Drop the wire-format keys so we don't ship them into the policy.
             for k in ("predicate_states_online", "predicate_mask_online", "predicate_progress_online"):
                 batch_copy.pop(k, None)
         else:
+            if self.prediction_count < 10 or self.prediction_count % 50 == 0:
+                logger.info(f"[NO ORACLE] pred#{self.prediction_count} — states={self.current_predicate_states[:num_predicates]} progress={np.round(self.current_predicate_progress[:num_predicates],2)}")
             batch_copy["predicate_states"] = self.current_predicate_states.copy()
             batch_copy["predicate_mask"] = predicate_mask
+            batch_copy["predicate_progress"] = self.current_predicate_progress.copy()
 
         # Ablation: nuke the entire predicate input channel.
         if self.config.ablation_zero_predicates:
@@ -624,11 +640,25 @@ class B1KPolicyWrapper():
             #     compression_status = f"compressed {actions_to_execute}→{execute_steps}" if should_compress else f"uncompressed ({execute_steps})"
             #     logger.info(f"🎯 Prediction #{self.prediction_count} | Actions: {compression_status} | Inpainting: {self.next_initial_actions is not None}")
             
-            # Update predicate states based on model predictions
+            # Update predicate states + progress based on model predictions
             if "predicate_logits" in output:
                 # Log BEFORE updating states (so we capture input states and output predictions)
                 self.log_predicate_entry(predicate_logits=output["predicate_logits"])
                 self.update_predicate_states(output["predicate_logits"])
+                # Update continuous progress for self-prediction path
+                num_preds = TASK_NUM_PREDICATES[self.task_id] if self.task_id is not None and 0 <= self.task_id < len(TASK_NUM_PREDICATES) else 0
+                if "progress_pred" in output:
+                    # Use calibrated progress head (MSE-trained, outputs smooth 0~1)
+                    prog = output["progress_pred"]
+                    if hasattr(prog, 'numpy'):
+                        prog = prog.numpy()
+                    self.current_predicate_progress[:num_preds] = np.clip(prog[:num_preds], 0.0, 1.0)
+                else:
+                    # Fallback: sigmoid of binary logits (less calibrated)
+                    logits = output["predicate_logits"]
+                    if hasattr(logits, 'numpy'):
+                        logits = logits.numpy()
+                    self.current_predicate_progress[:num_preds] = 1.0 / (1.0 + np.exp(-np.clip(logits[:num_preds], -20, 20)))
         
         # Get current action from sequence
         if self.action_index >= len(self.last_actions):
