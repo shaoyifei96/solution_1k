@@ -102,6 +102,62 @@ class PiBehaviorWeightLoader(WeightLoader):
             )
             return _merge_params(filtered_loaded, params, missing_regex=missing_regex)
 
+        elif enc == "v3_film":
+            logging.info("Loading checkpoint (v3_film: filter removed V1 + init FiLM encoder)")
+            # Filter out V1-specific params (not used in v3_film)
+            removed_prefixes = [
+                "task_predicate_embeddings", "gate_done", "gate_remaining",
+                "gate_task", "fusion_layer1", "fusion_layer2", "predicate_projection",
+            ]
+            # Also filter out old deep_sets params if loading from v2_deep_sets checkpoint
+            removed_prefixes += [
+                "pred_type_emb", "pred_name_emb", "pred_arg_emb",
+                "phi_fc", "rho_fc", "pred_token_proj",
+                "forall_fc", "exists_fc",
+            ]
+            filtered_loaded = {}
+            for key, value in loaded_params.items():
+                skip = any(prefix in key for prefix in removed_prefixes)
+                if skip:
+                    logging.info(f"  Skipping removed param: {key}")
+                else:
+                    filtered_loaded[key] = value
+
+            # All FiLM encoder params are new (randomly initialized)
+            missing_regex = (
+                ".*film_encoder.*|"
+                ".*progress_pred_from_vlm.*"
+            )
+            return _merge_params(filtered_loaded, params, missing_regex=missing_regex)
+
+        elif enc == "v2_soft":
+            logging.info("Loading checkpoint (v2_soft: filter old V1 + init soft encoder)")
+            # Filter out old V1 params (soft encoder has its own copy)
+            removed_prefixes = [
+                "task_predicate_embeddings", "gate_done", "gate_remaining",
+                "gate_task", "fusion_layer1", "fusion_layer2", "predicate_projection",
+            ]
+            # Also filter out deep_sets params if present
+            removed_prefixes += [
+                "pred_type_emb", "pred_name_emb", "pred_arg_emb",
+                "phi_fc", "rho_fc", "pred_token_proj",
+                "forall_fc", "exists_fc",
+            ]
+            filtered_loaded = {}
+            for key, value in loaded_params.items():
+                skip = any(prefix in key for prefix in removed_prefixes)
+                if skip:
+                    logging.info(f"  Skipping removed param: {key}")
+                else:
+                    filtered_loaded[key] = value
+
+            # All soft encoder params are new
+            missing_regex = (
+                ".*soft_encoder.*|"
+                ".*progress_pred_from_vlm.*"
+            )
+            return _merge_params(filtered_loaded, params, missing_regex=missing_regex)
+
         else:
             raise ValueError(f"Unknown predicate_encoder_type: {enc}")
 

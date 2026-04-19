@@ -117,7 +117,12 @@ class PiBehaviorConfig(_model.BaseModelConfig):
     # Implements approach from https://www.physicalintelligence.company/research/knowledge_insulation
     use_knowledge_insulation: bool = True
     
-    # Predicate encoder architecture: "v1" | "v2_progress" | "v2_deep_sets"
+    # Predicate encoder architecture:
+    #   "v1"           — task-specific embeddings + done/remaining hard partition + gated fusion
+    #   "v2_progress"  — v1 + progress MLP + is_quantified gate (has drowning bug)
+    #   "v2_deep_sets" — shared embeddings + concat state (has drowning bug: state=2/322)
+    #   "v3_film"      — shared embeddings + FiLM state modulation + Fourier progress (fixes drowning)
+    #   "v2_soft"      — v1 task-specific embeddings + soft pooling (fixes hard partition)
     predicate_encoder_type: str = "v1"
 
     # Predicate prediction auxiliary loss weight (relative to action loss)

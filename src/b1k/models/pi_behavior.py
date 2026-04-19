@@ -196,7 +196,29 @@ class PiBehavior(_model.BaseModel):
             # Project to 4 task tokens
             self.pred_token_proj = nnx.Linear(config.task_embedding_dim, config.task_embedding_dim * 4, rngs=rngs)
             _logging.info(f"PiBehavior: created v2_deep_sets modules (pred_type/name/arg_emb, phi_fc1/2, rho_fc1/2, pred_token_proj)")
-        
+
+        if encoder_type == "v3_film":
+            # v3_film: Deep Sets + FiLM modulation (fixes state signal drowning)
+            from b1k.models.predicate_encoder_film import PredicateEncoderFiLM
+            self.film_encoder = PredicateEncoderFiLM(
+                rngs=rngs,
+                predicate_encoding_dim=self.predicate_encoding_dim,
+                task_embedding_dim=config.task_embedding_dim,
+            )
+            self.progress_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_PREDICATES, rngs=rngs)
+            _logging.info(f"PiBehavior: created v3_film encoder (FiLM + Fourier progress)")
+
+        if encoder_type == "v2_soft":
+            # v2_soft: V1 task-specific embeddings + soft pooling (fixes hard partition)
+            from b1k.models.predicate_encoder_soft import PredicateEncoderSoft
+            self.soft_encoder = PredicateEncoderSoft(
+                rngs=rngs,
+                predicate_encoding_dim=self.predicate_encoding_dim,
+                task_embedding_dim=config.task_embedding_dim,
+            )
+            self.progress_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_PREDICATES, rngs=rngs)
+            _logging.info(f"PiBehavior: created v2_soft encoder (V1 + soft pooling)")
+
         # Pi05 style layers
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -677,7 +699,16 @@ class PiBehavior(_model.BaseModel):
             
             # Check if predicate states are available (required for PI_BEHAVIOR)
             if obs.predicate_states is not None and obs.predicate_mask is not None:
-                if self.config.predicate_encoder_type == "v2_deep_sets":
+                enc_type = self.config.predicate_encoder_type
+                if enc_type == "v3_film":
+                    fused_task_embeddings = self.film_encoder(obs, task_ids)
+                elif enc_type == "v2_soft":
+                    fused_task_embeddings = self.soft_encoder(
+                        base_task_embedding, task_ids,
+                        obs.predicate_states, obs.predicate_mask,
+                        getattr(obs, 'predicate_progress', None)
+                    )
+                elif enc_type == "v2_deep_sets":
                     fused_task_embeddings = self.encode_predicates_deep_sets(obs)
                 else:
                     fused_task_embeddings = self.fuse_task_and_predicates(
@@ -1108,7 +1139,7 @@ class PiBehavior(_model.BaseModel):
         # V2: Progress regression loss (MSE on continuous predicates)
         # Use gt_observation for targets
         progress_loss_value = 0.0
-        if train and self.config.predicate_encoder_type in ("v2_progress", "v2_deep_sets"):
+        if train and self.config.predicate_encoder_type in ("v2_progress", "v2_deep_sets", "v3_film", "v2_soft"):
             if hasattr(gt_observation, 'predicate_progress') and gt_observation.predicate_progress is not None:
                 progress_pred = jax.nn.sigmoid(self.progress_pred_from_vlm(base_task_output))  # [B, 20]
                 progress_target = gt_observation.predicate_progress.astype(jnp.float32)
