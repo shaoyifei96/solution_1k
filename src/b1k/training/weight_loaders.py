@@ -131,29 +131,47 @@ class PiBehaviorWeightLoader(WeightLoader):
             return _merge_params(filtered_loaded, params, missing_regex=missing_regex)
 
         elif enc == "v2_soft":
-            logging.info("Loading checkpoint (v2_soft: filter old V1 + init soft encoder)")
-            # Filter out old V1 params (soft encoder has its own copy)
-            removed_prefixes = [
+            logging.info("Loading checkpoint (v2_soft: transfer V1 params into soft_encoder)")
+            # V1 params that exist in soft_encoder under a nested path:
+            #   checkpoint: "task_predicate_embeddings/..." → model: "soft_encoder/task_predicate_embeddings/..."
+            #   checkpoint: "gate_done/..." → model: "soft_encoder/gate_done/..."
+            # We RENAME these keys to transfer learned weights.
+            v1_params_to_transfer = [
                 "task_predicate_embeddings", "gate_done", "gate_remaining",
                 "gate_task", "fusion_layer1", "fusion_layer2", "predicate_projection",
             ]
-            # Also filter out deep_sets params if present
-            removed_prefixes += [
+            # Deep Sets params to discard (not used in v2_soft)
+            discard_prefixes = [
                 "pred_type_emb", "pred_name_emb", "pred_arg_emb",
                 "phi_fc", "rho_fc", "pred_token_proj",
                 "forall_fc", "exists_fc",
             ]
             filtered_loaded = {}
             for key, value in loaded_params.items():
-                skip = any(prefix in key for prefix in removed_prefixes)
-                if skip:
-                    logging.info(f"  Skipping removed param: {key}")
-                else:
-                    filtered_loaded[key] = value
+                # Check if this is a V1 param that should be transferred
+                transferred = False
+                for v1_name in v1_params_to_transfer:
+                    if key == v1_name or key.startswith(v1_name + "/") or key.startswith(v1_name + "."):
+                        new_key = "soft_encoder/" + key
+                        filtered_loaded[new_key] = value
+                        logging.info(f"  Transfer: {key} → {new_key}")
+                        transferred = True
+                        break
+                if transferred:
+                    continue
+                # Discard deep_sets params
+                if any(prefix in key for prefix in discard_prefixes):
+                    logging.info(f"  Skipping: {key}")
+                    continue
+                # Keep everything else (PaliGemma, action expert, task_embeddings, etc.)
+                filtered_loaded[key] = value
 
-            # All soft encoder params are new
+            # Only FiLM layers + progress head are new (randomly initialized)
+            # V1 params transferred above will be found under soft_encoder/
             missing_regex = (
-                ".*soft_encoder.*|"
+                ".*soft_encoder/state_fc.*|"
+                ".*soft_encoder/film_gamma.*|"
+                ".*soft_encoder/film_beta.*|"
                 ".*progress_pred_from_vlm.*"
             )
             return _merge_params(filtered_loaded, params, missing_regex=missing_regex)
