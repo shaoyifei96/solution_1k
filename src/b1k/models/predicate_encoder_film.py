@@ -84,7 +84,7 @@ def fourier_encode(x, num_freqs: int = 8):
     return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)  # [..., 2*num_freqs]
 
 
-class PredicateEncoderFiLM:
+class PredicateEncoderFiLM(nnx.Module):
     """Deep Sets encoder with FiLM state modulation.
 
     Architecture:

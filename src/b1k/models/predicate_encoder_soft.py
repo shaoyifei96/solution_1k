@@ -26,7 +26,7 @@ from b1k.models.pi_behavior_config import (
 from b1k.models.predicate_encoder_film import fourier_encode, _snap_progress_batch
 
 
-class PredicateEncoderSoft:
+class PredicateEncoderSoft(nnx.Module):
     """V1 encoder with FiLM modulation + hard partition.
 
     Architecture:
