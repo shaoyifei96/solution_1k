@@ -1,14 +1,16 @@
-"""V1 predicate encoder with soft pooling (v2_soft).
+"""V1 predicate encoder with FiLM state modulation (v2_soft).
 
-Fixes V1's hard binary partition with progress-weighted soft pooling:
-- Original V1: done_mask = (state == True), remaining_mask = (state == False)
-  → hard partition, can't handle continuous progress (0.33, 0.67)
-- Soft pooling: done_pool = Σ(emb × progress) / Σ(progress)
-  → degenerates to V1 for binary (progress=0 or 1), smooth for continuous
+Keeps V1's task-specific embeddings and done/remaining hard partition,
+but adds FiLM modulation so progress controls each embedding dimension
+BEFORE pooling. This way even 1-predicate tasks get progress-dependent
+representations in the done/remaining pools.
 
-Also adds Fourier encoding of progress for the soft pooling weights.
+Ablation role:
+- v2_soft: task-specific emb + FiLM + hard partition → tests V1 embeddings
+- v3_film: shared emb + FiLM + sum pooling → tests Deep Sets embeddings
+- FiLM is constant across both → isolates embedding type and pooling method
 
-Uses V1's task-specific predicate embeddings (not shared Deep Sets).
+Uses same Fourier encoding and clamp logic as v3_film.
 """
 
 import flax.nnx as nnx
@@ -21,26 +23,31 @@ from b1k.models.pi_behavior_config import (
     TOTAL_TASK_PREDICATE_EMBEDDINGS,
     MAX_NUM_PREDICATES,
 )
+from b1k.models.predicate_encoder_film import fourier_encode, _snap_progress_batch
 
 
 class PredicateEncoderSoft:
-    """V1 encoder with soft pooling.
+    """V1 encoder with FiLM modulation + hard partition.
 
     Architecture:
-        1. Task-specific predicate embeddings (1024-dim each, from V1 embedding table)
-        2. Soft pooling: progress-weighted done/remaining pools
-           done_pool = Σ(emb_i × progress_i) / Σ(progress_i)
-           remaining_pool = Σ(emb_i × (1 - progress_i)) / Σ(1 - progress_i)
-        3. Gated fusion with task embedding (same as V1)
-        4. Output: [B, 4, 2048]
+        1. Task-specific predicate embeddings (1024-dim, from V1 table)
+        2. FiLM: progress+state → gamma/beta that modulate each embedding
+        3. Hard partition: done_pool = mean(modulated_emb where state==True)
+        4. Gated fusion with task embedding (same as V1)
+        5. Output: [B, 4, 2048]
 
-    For binary predicates (progress ∈ {0, 1}), this is IDENTICAL to V1.
-    For continuous predicates (progress ∈ [0, 1]), soft pooling smoothly distributes
-    each embedding between done and remaining pools.
+    For binary predicates: FiLM modulates by 0/1 state, partition = V1.
+    For continuous progress: FiLM modulates by progress level,
+    so the SAME embedding produces different representations at different progress.
     """
 
     def __init__(self, rngs: nnx.Rngs, predicate_encoding_dim: int = 1024,
-                 task_embedding_dim: int = 2048):
+                 task_embedding_dim: int = 2048, num_fourier_freqs: int = 8):
+        self.num_fourier_freqs = num_fourier_freqs
+        fourier_dim = 2 * num_fourier_freqs  # 16
+        state_input_dim = fourier_dim + 1  # 16 (fourier progress) + 1 (satisfied) = 17
+        state_hidden_dim = 64
+
         # V1's task-specific predicate embedding table
         self.task_predicate_embeddings = nnx.Embed(
             num_embeddings=TOTAL_TASK_PREDICATE_EMBEDDINGS,
@@ -48,8 +55,20 @@ class PredicateEncoderSoft:
             rngs=rngs,
         )
 
+        # FiLM: state → gamma/beta for each predicate embedding
+        self.state_fc1 = nnx.Linear(state_input_dim, state_hidden_dim, rngs=rngs)
+        self.state_fc2 = nnx.Linear(state_hidden_dim, state_hidden_dim, rngs=rngs)
+        self.film_gamma = nnx.Linear(state_hidden_dim, predicate_encoding_dim, rngs=rngs)
+        self.film_beta = nnx.Linear(state_hidden_dim, predicate_encoding_dim, rngs=rngs)
+
+        # Zero-init FiLM (identity at start)
+        self.film_gamma.kernel.value = jnp.zeros_like(self.film_gamma.kernel.value)
+        self.film_gamma.bias.value = jnp.ones_like(self.film_gamma.bias.value)
+        self.film_beta.kernel.value = jnp.zeros_like(self.film_beta.kernel.value)
+        self.film_beta.bias.value = jnp.zeros_like(self.film_beta.bias.value)
+
         # V1's gated fusion layers
-        fusion_input_dim = task_embedding_dim + 2 * predicate_encoding_dim  # 2048 + 2*1024 = 4096
+        fusion_input_dim = task_embedding_dim + 2 * predicate_encoding_dim  # 4096
         self.gate_done = nnx.Linear(fusion_input_dim, predicate_encoding_dim, rngs=rngs)
         self.gate_remaining = nnx.Linear(fusion_input_dim, predicate_encoding_dim, rngs=rngs)
         self.gate_task = nnx.Linear(fusion_input_dim, task_embedding_dim, rngs=rngs)
@@ -57,47 +76,9 @@ class PredicateEncoderSoft:
         self.fusion_layer2 = nnx.Linear(task_embedding_dim * 2, task_embedding_dim, rngs=rngs)
         self.predicate_projection = nnx.Linear(2 * predicate_encoding_dim, task_embedding_dim, rngs=rngs)
 
-    def aggregate_soft(self, task_ids, predicate_mask, predicate_progress):
-        """Soft pooling: progress-weighted done/remaining aggregation.
-
-        Args:
-            task_ids: [B] task indices
-            predicate_mask: [B, P] valid predicate mask
-            predicate_progress: [B, P] progress values in [0, 1]
-
-        Returns:
-            done_agg: [B, 1024] — progress-weighted average (what's done)
-            remaining_agg: [B, 1024] — (1-progress)-weighted average (what remains)
-        """
-        # Look up task-specific embeddings (same as V1)
-        task_pred_offsets = jnp.array(TASK_PREDICATE_OFFSETS, dtype=jnp.int32)
-        offsets = task_pred_offsets[task_ids]  # [B]
-        pred_range = jnp.arange(MAX_NUM_PREDICATES)
-        pred_indices = offsets[:, None] + pred_range[None, :]  # [B, P]
-        max_idx = TOTAL_TASK_PREDICATE_EMBEDDINGS - 1
-        pred_indices = jnp.clip(pred_indices, 0, max_idx)
-
-        all_embeddings = self.task_predicate_embeddings(pred_indices)  # [B, P, 1024]
-
-        # Soft pooling weights
-        mask = predicate_mask.astype(jnp.float32)  # [B, P]
-        progress = predicate_progress.astype(jnp.float32)  # [B, P]
-
-        # Done weights = progress * mask
-        done_weights = progress * mask  # [B, P]
-        done_weights_sum = jnp.maximum(jnp.sum(done_weights, axis=1, keepdims=True), 1e-6)  # [B, 1]
-        done_agg = jnp.sum(all_embeddings * done_weights[..., None], axis=1) / done_weights_sum  # [B, 1024]
-
-        # Remaining weights = (1 - progress) * mask
-        remaining_weights = (1.0 - progress) * mask  # [B, P]
-        remaining_weights_sum = jnp.maximum(jnp.sum(remaining_weights, axis=1, keepdims=True), 1e-6)  # [B, 1]
-        remaining_agg = jnp.sum(all_embeddings * remaining_weights[..., None], axis=1) / remaining_weights_sum  # [B, 1024]
-
-        return done_agg, remaining_agg
-
     def __call__(self, task_embedding, task_ids, predicate_states, predicate_mask,
                  predicate_progress=None):
-        """Encode predicates with soft pooling + gated fusion.
+        """Encode predicates with FiLM + V1 hard partition.
 
         Args:
             task_embedding: [B, 2048] base task embedding
@@ -109,44 +90,66 @@ class PredicateEncoderSoft:
         Returns:
             [B, 4, 2048] fused task+predicate tokens
         """
-        # Use binary states as progress if no continuous progress available
         if predicate_progress is None:
             predicate_progress = predicate_states.astype(jnp.float32)
 
-        # Soft pooling
-        done_agg, remaining_agg = self.aggregate_soft(
-            task_ids, predicate_mask, predicate_progress
-        )  # [B, 1024], [B, 1024]
+        # === Step 1: Look up task-specific embeddings (V1 style) ===
+        task_pred_offsets = jnp.array(TASK_PREDICATE_OFFSETS, dtype=jnp.int32)
+        offsets = task_pred_offsets[task_ids]
+        pred_range = jnp.arange(MAX_NUM_PREDICATES)
+        pred_indices = offsets[:, None] + pred_range[None, :]
+        max_idx = TOTAL_TASK_PREDICATE_EMBEDDINGS - 1
+        pred_indices = jnp.clip(pred_indices, 0, max_idx)
 
-        # Gated fusion (identical to V1's fuse_task_and_predicates)
+        all_embeddings = self.task_predicate_embeddings(pred_indices)  # [B, P, 1024]
+
+        # === Step 2: Clamp progress + Fourier encode + FiLM ===
+        progress = _snap_progress_batch(predicate_progress, task_ids)  # snap to k/M grid
+        progress_fourier = fourier_encode(progress, self.num_fourier_freqs)  # [B, P, 16]
+        satisfied = predicate_states.astype(jnp.float32)[..., None]          # [B, P, 1]
+        state_input = jnp.concatenate([progress_fourier, satisfied], axis=-1) # [B, P, 17]
+
+        state_encoded = nnx.relu(self.state_fc1(state_input))   # [B, P, 64]
+        state_encoded = nnx.relu(self.state_fc2(state_encoded)) # [B, P, 64]
+
+        gamma = self.film_gamma(state_encoded)  # [B, P, 1024]
+        beta = self.film_beta(state_encoded)    # [B, P, 1024]
+
+        modulated = gamma * all_embeddings + beta  # [B, P, 1024] — progress-aware embeddings
+
+        # === Step 3: V1-style hard partition (done / remaining pools) ===
+        done_mask = predicate_states & predicate_mask       # [B, P]
+        remaining_mask = ~predicate_states & predicate_mask  # [B, P]
+
+        done_sum = jnp.sum(modulated * done_mask[..., None], axis=1)
+        num_done = jnp.maximum(jnp.sum(done_mask, axis=1, keepdims=True), 1.0)
+        done_agg = done_sum / num_done  # [B, 1024]
+
+        remaining_sum = jnp.sum(modulated * remaining_mask[..., None], axis=1)
+        num_remaining = jnp.maximum(jnp.sum(remaining_mask, axis=1, keepdims=True), 1.0)
+        remaining_agg = remaining_sum / num_remaining  # [B, 1024]
+
+        # === Step 4: Gated fusion (identical to V1) ===
         all_inputs = jnp.concatenate([
-            task_embedding,   # [B, 2048]
-            done_agg,         # [B, 1024]
-            remaining_agg     # [B, 1024]
+            task_embedding, done_agg, remaining_agg
         ], axis=-1)  # [B, 4096]
 
-        gate_done = nnx.sigmoid(self.gate_done(all_inputs))            # [B, 1024]
-        gate_remaining = nnx.sigmoid(self.gate_remaining(all_inputs))  # [B, 1024]
-        gate_task = nnx.sigmoid(self.gate_task(all_inputs))            # [B, 2048]
+        gate_done = nnx.sigmoid(self.gate_done(all_inputs))
+        gate_remaining = nnx.sigmoid(self.gate_remaining(all_inputs))
+        gate_task = nnx.sigmoid(self.gate_task(all_inputs))
 
-        # 1. Task-gated representation
-        task_gated = task_embedding * gate_task  # [B, 2048]
+        task_gated = task_embedding * gate_task
+        x = nnx.relu(self.fusion_layer1(all_inputs))
+        balanced_fusion = self.fusion_layer2(x)
 
-        # 2. Balanced fusion
-        x = nnx.relu(self.fusion_layer1(all_inputs))  # [B, 4096]
-        balanced_fusion = self.fusion_layer2(x)         # [B, 2048]
-
-        # 3. Remaining-focus representation
         gated_remaining = jnp.concatenate([
             done_agg * gate_done,
             remaining_agg * gate_remaining
-        ], axis=-1)  # [B, 2048]
-        gated_predicate_proj = self.predicate_projection(gated_remaining)  # [B, 2048]
+        ], axis=-1)
+        gated_predicate_proj = self.predicate_projection(gated_remaining)
 
-        # 4. Done-focus representation
-        raw_predicates = jnp.concatenate([done_agg, remaining_agg], axis=-1)  # [B, 2048]
+        raw_predicates = jnp.concatenate([done_agg, remaining_agg], axis=-1)
 
-        # Stack all four representations
         fused_embeddings = jnp.stack([
             task_gated, balanced_fusion, gated_predicate_proj, raw_predicates
         ], axis=1)  # [B, 4, 2048]
