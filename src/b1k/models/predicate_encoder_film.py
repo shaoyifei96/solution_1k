@@ -36,12 +36,12 @@ _PROGRESS_M: Dict[int, List[int]] = {
 # Pre-built M lookup table: [num_tasks, MAX_NUM_PREDICATES]
 # Constant, built once at import time, not during JIT trace.
 import numpy as _np
-_M_TABLE_NP = _np.ones((len(TASK_NUM_PREDICATES), MAX_NUM_PREDICATES), dtype=_np.float32)
+# Keep as numpy array (NOT jnp) — JIT auto-converts numpy constants.
+# Using jnp.array at module level causes UnexpectedTracerError in FSDP multi-GPU.
+_M_TABLE = _np.ones((len(TASK_NUM_PREDICATES), MAX_NUM_PREDICATES), dtype=_np.float32)
 for _tid, _ms in _PROGRESS_M.items():
     for _i, _m in enumerate(_ms):
-        _M_TABLE_NP[_tid, _i] = float(_m)
-_M_TABLE = jnp.array(_M_TABLE_NP)
-del _M_TABLE_NP  # cleanup
+        _M_TABLE[_tid, _i] = float(_m)
 
 
 def _snap_progress_batch(progress, task_ids):
