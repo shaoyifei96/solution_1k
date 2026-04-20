@@ -59,7 +59,7 @@ def _snap_progress_batch(progress, task_ids):
     Returns:
         [B, P] snapped progress values
     """
-    m_vals = _M_TABLE[task_ids]  # [B, P] — constant lookup, no trace-time loop
+    m_vals = jnp.array(_M_TABLE)[task_ids]  # numpy→jnp inside JIT (becomes constant)
     snapped = jnp.round(progress * m_vals) / m_vals
     return jnp.clip(snapped, 0.0, 1.0)
 
